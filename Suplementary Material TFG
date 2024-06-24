@@ -1,1 +1,3535 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+from pandas.tseries.holiday import AbstractHolidayCalendar, Holiday, Easter, Day
+from scipy.stats import mannwhitneyu
+from scipy.stats import ttest_ind
+import numpy as np
+import seaborn as sns
+import statistics 
+from statsmodels.tsa.seasonal import seasonal_decompose
+from statsmodels.graphics.tsaplots import plot_acf
+from lightgbm import LGBMRegressor
+from sklearn.metrics import mean_absolute_error
+import lightgbm as lgb
+from prophet import Prophet
+from scipy.stats import norm
+from prophet.diagnostics import cross_validation
+from prophet.diagnostics import performance_metrics
+from prophet.plot import plot_cross_validation_metric
+
+# Skforecast
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_absolute_error
+from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+
+from skforecast.ForecasterAutoreg import ForecasterAutoreg
+from skforecast.ForecasterAutoregCustom import ForecasterAutoregCustom
+from skforecast.ForecasterAutoregDirect import ForecasterAutoregDirect
+from skforecast.model_selection import grid_search_forecaster
+from skforecast.model_selection import backtesting_forecaster
+from skforecast.utils import save_forecaster
+from skforecast.utils import load_forecaster
+
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.layers import LSTM
+import math
+
+plt.rcParams['font.family'] = 'Arial'
+# Leemos los datos
+ruta='C:/Users/Elena/Desktop/TFG/mes 1/datos/datos_gripe_fechas_casos.csv'
+datos_fechas_casos=pd.read_csv(ruta,parse_dates =["fecha"], index_col ="fecha")
+
+# Leemos datos incidencia
+#ruta_incidencia_casos='C:/Users/Elena/Desktop/TFG/mes 1/datos/incidencia.csv'
+#datos_incidencia=pd.read_csv(ruta_incidencia_casos, parse_dates=["fecha"], index_col="fecha")
+
+# Leemos datos incidencia con casos suavizados
+ruta_incidencia_casos='C:/Users/Elena/Desktop/TFG/mes 1/datos/incidencia_casos_suavizados.csv'
+datos_incidencia=pd.read_csv(ruta_incidencia_casos, parse_dates=["fecha"], index_col="fecha")
+
+# Calculamos casos suavizados
+datos_fechas_casos['casos_suavizados']=datos_fechas_casos['casos'].rolling(window=7, center=True, min_periods=1).mean()
+
+# Definimos un calendario de festivos
+class CatCalendar(AbstractHolidayCalendar):
+        rules = [
+         Holiday('Any Nou', month=1, day=1),
+         Holiday('Reis', month=1, day=6),
+         Holiday('Divendres SS', month=1, day=1, offset=[Easter(), Day(-2)]),
+         Holiday('Dilluns de Pasqua', month=1, day=1, offset=[Easter(), Day(1)]),
+         Holiday('Pentecosta', month=1, day=1, offset=[Easter(), Day(49)]),
+         Holiday('Dia del Treballador', month=5, day=1),
+         Holiday('Sant Joan', month=6, day=24),
+         Holiday('Dia Asumpció', month=8, day=15),
+         Holiday('Diada', month=9, day=11),
+         Holiday('Dia del Pilar', month=10, day=12),
+         Holiday('Tots Sants', month=11, day=1),
+         Holiday('Dia Constitució', month=12, day=6),
+         Holiday('Immaculada Concepció', month=12, day=8), 
+         Holiday('Nadal', month=12, day=25),
+         Holiday('Sant Esteve', month=12, day=26),
+       ]
+
+cal = CatCalendar()
+holidays = cal.holidays(start=datos_fechas_casos.index.min(), end=datos_fechas_casos.index.max())
+
+# Agregar una columna con los nombres de los días de la semana
+datos_fechas_casos['dia_semana'] = datos_fechas_casos.index.day_name()
+
+# Agregamos una columna de festivos
+datos_fechas_casos['festivo']=datos_fechas_casos.index.isin(holidays)
+
+# Modificamos los valores de la columna 'dia_semana' donde 'festivo' es True
+datos_fechas_casos.loc[datos_fechas_casos['festivo'], 'dia_semana'] = 'Holiday'
+
+condicion_festivo = (
+    (
+        (~datos_fechas_casos['festivo']) &  # Días laborables originales
+        (datos_fechas_casos['festivo'].shift(-1) & datos_fechas_casos['festivo'].shift(1))  # Cumple la condición de tres días consecutivos festivo-laborable-festivo
+    ) |
+    (
+        ((datos_fechas_casos['festivo'].shift(1)) & (datos_fechas_casos['dia_semana'] == 'Friday'))  # Cumple la condición de festivo-laborable-sábado
+    ) |
+    (
+        ((datos_fechas_casos['dia_semana'] == 'Monday') & datos_fechas_casos['festivo'].shift(-1))  # Cumple la condición de domingo-laborable-festivo   
+    ) |
+    (   ((datos_fechas_casos['dia_semana'] == 'Saturday') & datos_fechas_casos['festivo'].shift(1))  # Cumple la condición de festivo-sábado-domingo
+    )
+)
+
+# Modificamos la columna 'festivo' y la columna 'dia_semana' para los días que cumplen la condición 
+datos_fechas_casos.loc[condicion_festivo, 'festivo'] = True
+datos_fechas_casos.loc[condicion_festivo, 'dia_semana'] = 'Holiday'
+
+condicion_lunes = (
+   (~(datos_fechas_casos['dia_semana'] == 'Monday')) &
+   (~(datos_fechas_casos['dia_semana'] == 'Holiday')) &
+   (~(datos_fechas_casos['dia_semana'] == 'Saturday')) &
+   (~(datos_fechas_casos['dia_semana'] == 'Sunday')) & 
+   (datos_fechas_casos['festivo'].shift(1))
+   )
+
+# Modificamos la columna 'dia_semana' para los días que cumplen la condicion lunes
+datos_fechas_casos.loc[condicion_lunes, 'dia_semana'] = 'Monday'
+
+# Marcamos el dia 5 del mes 12 del año 2022 como Lunes
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-05'),'dia_semana'] = 'Monday'
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-07'),'dia_semana'] = 'Wednesday'
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-09'),'dia_semana'] = 'Friday'
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-05'),'festivo'] = False
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-07'),'festivo'] = False
+datos_fechas_casos.loc[(datos_fechas_casos.index == '2022-12-09'),'festivo'] = False
+# Marcamos el día 7 del mes 12 como festivo
+#datos_fechas_casos.loc[(datos_fechas_casos.index.month == 12) & (datos_fechas_casos.index.day == 7), 'festivo'] = True
+
+# Reemplazar el valor 'Holiday' para las fechas festivas (de esta forma, en el for, sí que habrá día_semana que sean Holiday)
+# datos_fechas_casos.loc[datos_fechas_casos['festivo'], 'dia_semana'] = 'Holiday' ya está hecho arriba
+
+# Creamos una columna 'pesos' inicializada con NaN
+datos_fechas_casos['pesos']=float('nan')
+
+# Definimos días de la semana (incluimos festivos)
+dias_semana=['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday', 'Holiday']
+
+# Calculamos pesos y los añadimos a la columna de 'pesos'
+for dia in dias_semana:
+    if dia == 'Holiday':
+        datos_dia=datos_fechas_casos[datos_fechas_casos['festivo']]
+        
+    else:
+        datos_dia=datos_fechas_casos[datos_fechas_casos['dia_semana'] == dia]
+    
+    datos_dia['pesos']=datos_dia['casos']/datos_dia['casos_suavizados']
+    datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia, 'pesos']=datos_dia['pesos']
+    
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(datos_dia.index, datos_dia['pesos'], linestyle='-', linewidth=0.8)
+    plt.title(f'Weights for {dia}s', fontsize = 22)
+    plt.xlabel('Date')
+    plt.ylabel('Weigths') 
+    plt.grid(True)  # Mostrar la cuadrícula
+    plt.tight_layout()  # Ajustar el diseño
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(datos_dia.index, datos_dia['casos'], linestyle='-', linewidth=0.8, label='Real Cases')
+    plt.plot(datos_dia.index, datos_dia['casos_suavizados'], linestyle='-', linewidth=0.8, label='Smoothed Cases')
+    plt.title(f'Real Cases vs Smoothed Cases for {dia}s', fontsize = 22)
+    plt.xlabel('Date', fontsize = 20)
+    plt.ylabel('Values', fontsize = 20)
+    plt.legend(loc='best', fontsize = 14)
+    plt.grid(True)  # Mostrar la cuadrícula
+    plt.tight_layout()  # Ajustar el diseño
+    
+    plt.figure(figsize=(12, 6))
+    plt.plot(datos_dia.index, datos_dia['casos_suavizados'], linestyle='-', linewidth=0.8)
+    plt.title(f'Smoothed Cases for {dia}s', fontsize = 22)
+    plt.xlabel('Date')
+    plt.ylabel('Smoothed Cases') 
+    plt.grid(True)  # Mostrar la cuadrícula
+    plt.tight_layout()  # Ajustar el diseño
+    
+plt.show()
+
+
+# Hacer zoom en una región específica
+plt.figure(figsize=(20, 6))
+plt.plot(datos_fechas_casos.index, datos_fechas_casos.casos, marker='o', linestyle='-', color='r', label = 'Influenza cases')
+plt.plot(datos_fechas_casos.index, datos_fechas_casos.casos_suavizados, marker='o', linestyle='-', color='b', label='Smoothed Cases')
+plt.title('Zoom in on a Specific Region', fontsize=22)
+plt.xlabel('Date')
+plt.ylabel('Number of cases')
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+# Establecer los límites del eje x y del eje y para hacer zoom
+plt.xlim(pd.to_datetime('2015-01-25'), pd.to_datetime('2015-03-01'))  # Cambiar estos valores según la región que desees hacer zoom
+plt.ylim(0, 5000)  # Cambiar estos valores según la región que desees hacer zoom
+
+
+# Hacer zoom en una región específica
+plt.figure(figsize=(20, 6))
+plt.plot(datos_fechas_casos.index, datos_fechas_casos.casos, marker='o', linestyle='-', color='r')
+plt.title('Zoom in on a Specific Region', fontsize=22)
+plt.xlabel('Date')
+plt.ylabel('Influenza Cases')
+plt.grid(True)
+plt.tight_layout()
+# Establecer los límites del eje x y del eje y para hacer zoom
+plt.xlim(pd.to_datetime('2015-01-25'), pd.to_datetime('2015-03-01'))  # Cambiar estos valores según la región que desees hacer zoom
+plt.ylim(0, 5000)  # Cambiar estos valores según la región que desees hacer zoom
+
+
+# Procedemos a usar el método mann whitney u para calcular el p-value y hacer comparaciones
+p_values_mediana={}
+df_resultados_mediana=pd.DataFrame(index=dias_semana, columns=dias_semana, dtype=np.float64)
+
+for dia_1 in dias_semana:
+    x = datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia_1, 'casos']
+    
+    for dia_2 in dias_semana:
+        if (dia_1 != dia_2):
+            y = datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia_2, 'casos']
+            p_value_mediana=mannwhitneyu(x,y).pvalue*7
+            p_values_mediana[f'{dia_1}_{dia_2}']=p_value_mediana
+            df_resultados_mediana.at[dia_1,dia_2]=p_value_mediana
+
+
+ruta_df='C:/Users/Elena/Desktop/TFG/mes 1/datos/tabla_pvalue_mediana_casos.xlsx'
+df_resultados_mediana.to_excel(ruta_df)
+
+# Holiday y Saturday tienen un pvalue muy alto
+#datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == (['Saturday','Holiday']) ,'dia_semana']='Saturday/Holiday'
+#datos_fechas_casos.loc[(datos_fechas_casos['dia_semana'] == 'Saturday') | (datos_fechas_casos['dia_semana'] == 'Holiday'), 'dia_semana'] = 'Saturday/Holiday'
+
+# Filtramos los datos para el conjunto 'Saturday/Holiday'
+nuevos_datos_sabados_festivos=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(['Saturday', 'Holiday'])].copy()
+
+# Asignamos la etiqueta 'Saturday/Holiday' a la nueva columna 'dia_semana'
+nuevos_datos_sabados_festivos['dia_semana']='Saturday/Holiday'
+
+# Calculamos pesos
+nuevos_datos_sabados_festivos['pesos']=nuevos_datos_sabados_festivos['casos'] / nuevos_datos_sabados_festivos['casos_suavizados']
+
+# Visualizamos los pesos
+#plt.figure()
+#plt.plot(nuevos_datos_sabados_festivos.index, nuevos_datos_sabados_festivos['pesos'], linestyle='-', linewidth=0.8)
+#plt.title('Pesos para Sábados y Festivos (Nuevo DataFrame)')
+#plt.xlabel('Fecha')
+#plt.ylabel('Pesos')
+#plt.show()
+
+# Procedemos a usar el método ttest_ind(x,y) para calcular el p-value y hacer comparaciones
+p_values_media={}
+df_resultados_media=pd.DataFrame(index=dias_semana, columns=dias_semana, dtype=np.float64)
+
+for dia_1 in dias_semana:
+    x = datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia_1, 'casos']
+    
+    for dia_2 in dias_semana:
+        if (dia_1 != dia_2):
+            y = datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia_2, 'casos']
+            p_value_media=ttest_ind(x,y).pvalue*7
+            p_values_media[f'{dia_1}_{dia_2}']=p_value_media
+            df_resultados_media.at[dia_1,dia_2]=p_value_media
+#print(p_values)
+
+ruta_df='C:/Users/Elena/Desktop/TFG/mes 1/datos/tabla_pvalue_media_casos.xlsx'
+df_resultados_media.to_excel(ruta_df)
+
+# Histogramas
+for dia in dias_semana:
+    plt.figure()
+    plt.hist(datos_fechas_casos.loc[datos_fechas_casos['dia_semana'] == dia,'pesos'], bins=20, edgecolor='black')
+    plt.title(f'Histograma de Pesos para {dia}s')
+    plt.xlabel('Pesos')
+    plt.ylabel('Frecuencia')
+plt.show()
+
+# Filtrar el DataFrame de datos_fechas_casos para incluir solo los datos a partir de 2012 & hasta 2024
+datos_fechas_casos = datos_fechas_casos[(datos_fechas_casos.index.year >= 2012) & (datos_fechas_casos.index.year <= 2024)]
+datos_fechas_casos['incidencia']=datos_incidencia['incidencia'].copy()
+
+# Creamos función para asignar categorías basadas en la tabla de niveles epidémicos
+def clasificar_incidencia(incidencia):
+    if incidencia < 9.44 / 7:
+        return 'No Epidemic'
+    elif 9.44 / 7 <= incidencia < 20.76 / 7:
+        return 'Very Low'
+    elif 20.76 / 7 <= incidencia < 52.67 / 7:
+        return 'Low'
+    elif 52.67 / 7 <= incidencia < 137.79 / 7:
+        return 'Medium'
+    elif 137.79 / 7 <= incidencia <= 213.9 / 7:
+        return 'High'
+    elif incidencia > 213.9 / 7:
+        return 'Very High'
+
+# Aplicamos la función a la columna incidencia y creamos nueva columna 'categoria_incidencia'
+datos_fechas_casos['categoria_incidencia']=datos_fechas_casos['incidencia'].apply(clasificar_incidencia)
+
+# Iteramos sobre cada día de la semana
+plt.rcParams['font.family'] = "Arial"
+
+for dia in dias_semana:
+    a = 0
+    b = 1
+    datos_dia=datos_fechas_casos[datos_fechas_casos['dia_semana'] == dia]
+    fig,ax = plt.subplots(2,3, figsize=(23, 15))
+    fig.suptitle(f'Weight Analysis for {dia}s', y=1, fontsize=22)
+    plt.subplots_adjust(hspace=0.3, wspace=0.3)
+    ax[0][0].hist(datos_dia['pesos'], edgecolor='black', linewidth=0.5)
+    ax[0][0].set_xlim((0,3))
+    ax[0][0].set_title(f'Weights for {dia}s', fontsize=22)  
+    ax[0][0].set_xlabel('Weights', fontsize=20)
+    ax[0][0].set_ylabel('Frequency', fontsize=20)
+    desviacion = statistics.pstdev(datos_dia['pesos'])
+    ax[0][0].text(0.7, 0.8, f'Standard Deviation: {desviacion:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='red')
+    media_peso = np.mean(datos_dia['pesos'])
+    ax[0][0].text(0.7, 0.9, f'Mean: {media_peso:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='magenta')
+    mediana_peso = np.median(datos_dia['pesos'])
+    ax[0][0].text(0.7, 0.85, f'Median: {mediana_peso:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='blue')
+    
+    #Iteramos sobre cada categoría de incidencia 
+    colores = sns.color_palette("viridis", n_colors=len(['Very Low', 'Low', 'Medium', 'High', 'Very High']))
+    for i, categoria in enumerate (['Very Low', 'Low', 'Medium', 'High', 'Very High']):
+        datos_categoria=datos_dia[datos_dia['categoria_incidencia'] == categoria]
+        color_categoria=colores[i]
+        ax[a][b].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=color_categoria, label=categoria)
+        ax[a][b].set_xlim((0,3))
+        ax[a][b].set_ylim(bottom=0) 
+        ax[a][b].set_title(f'{categoria} Incidence', fontsize=22)  
+        ax[a][b].set_xlabel('Weights', fontsize=20)
+        ax[a][b].set_ylabel('Frequency', fontsize=20)
+        #ax[a][b].legend()
+        
+        # Calculamos y mostramos la media y la mediana
+        media_peso = np.mean(datos_categoria['pesos'])
+        mediana_peso = np.median(datos_categoria['pesos'])
+        
+        # Verificamos si hay datos antes de calcular la desviación
+        if not datos_categoria.empty:
+            desviacion = statistics.pstdev(datos_categoria['pesos'])
+            ax[a][b].text(0.7, 0.8, f'Standard Deviation: {desviacion:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='red')
+        else:
+            ax[a][b].text(0.7, 0.8, 'No data', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='red')
+
+        # Mostramos la media y la mediana en el subgráfico
+        ax[a][b].text(0.7, 0.9, f'Mean: {media_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='magenta')
+        ax[a][b].text(0.7, 0.85, f'Median: {mediana_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='blue')
+        
+        # Mostramos la media y la mediana en el subgráfico
+        #ax[a][b].text(0.7, 0.9, f'Media: {media_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='magenta')
+        #ax[a][b].text(0.7, 0.85, f'Mediana: {mediana_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='blue')
+        #ax[a][b].text(0.7, 0.8, f'Desviación: {desviación:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='red')
+        print(f'Media de pesos para {categoria} en {dia}: {media_peso:.2f}')
+        print(f'Mediana de pesos para {categoria} en {dia}: {mediana_peso:.2f}')
+        
+        if b<2:
+            b+=1
+        elif b == 2:
+            a+=1
+            b=0
+
+    #fig.savefig(f'histograma_pesos_{dia}_incidencia_casos.png', dpi=600, format='png')
+# Visualización de la distribución gaussiana de los pesos para cada día de la semana
+# Medianas y desviaciones estándar para cada día de la semana
+#medianas = [1.68, 1.33, 1.27, 1.13, 0.98, 0.34, 0.28, 0.40]
+#desviaciones = [0.37,0.3, 0.3, 0.32, 0.28, 0.22, 0.25, 0.41]
+medianas = [1.70, 1.33, 1.26, 1.12, 0.98, 0.33, 0.28, 0.43]
+desviaciones = [0.37, 0.28, 0.29, 0.29, 0.28, 0.22, 0.24, 0.38]
+dias_semana = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo', 'Holiday']
+
+# Crear una figura para la distribución gaussiana
+plt.figure(figsize=(12, 8))
+plt.title('Gaussian Distributions of Weights by Day of the Week', fontsize = 22)
+
+# Iterar sobre cada día y graficar la distribución gaussiana en la misma figura
+for i, dia in enumerate(dias_semana):
+    # Generar datos para la distribución normal
+    datos = np.random.normal(loc=medianas[i], scale=desviaciones[i], size=10000)
+    #x = np.linspace(medias[i] - 2*desviaciones[i], medias[i] + 2*desviaciones[i], 1000)
+    #y = norm.pdf(x, medias[i], desviaciones[i])
+    x = np.linspace(min(datos), max(datos), 100)
+    y = norm.pdf(x, loc=medianas[i], scale=desviaciones[i])
+    # Trazar la distribución gaussiana
+    plt.plot(x, y, label=f'{dia}: Median={medianas[i]}, Deviation={desviaciones[i]}')
+
+plt.xlabel('Weight values', fontsize = 20)
+plt.ylabel('Probability Density', fontsize = 20)
+plt.grid(True)
+plt.tight_layout()
+plt.legend(loc='upper right', fontsize = 14)
+plt.grid(True)
+plt.show()
+# Agruación de días en : lunes, martes-miércoles-jueves, viernes, fines de semana-festivos
+#lunes = datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(['Monday'])].copy()
+#mar_mier_juev=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(['Tuesday', 'Wednesday', 'Thursday'])].copy()
+#vier=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(['Friday'])].copy()
+#fin_fes=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(['Saturday', 'Sunday', 'Holiday'])].copy()
+
+grupos_dias={'Monday':['Monday'], 'Tuesday-Wednesday-Thursday': ['Tuesday','Wednesday', 'Thursday'], 'Friday': ['Friday'], 'Weekend-Festivity':['Saturday','Sunday','Holiday']}
+
+for grupo, dias in grupos_dias.items():
+    a=0
+    b=1
+    grupo_df=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(dias)].copy()
+    
+    
+    fig,ax = plt.subplots(2,3, figsize=(23, 15))
+    fig.suptitle(f'Weight Analysis by Groups: {grupo}', y=1, fontsize=30)
+    plt.subplots_adjust(hspace=0.3, wspace=0.3)
+    # Ajustar el tamaño de fuente para los números de los ejes x e y
+    #plt.rc('xtick', labelsize=25)    # Tamaño de fuente para números en el eje x
+    #plt.rc('ytick', labelsize=25)    # Tamaño de fuente para números en el eje y
+    # Ajustar el tamaño de fuente para los números de los ejes x e y en todos los subgráficos
+    for row in ax:
+        for subplot in row:
+            subplot.tick_params(axis='both', labelsize=25)
+    ax[0][0].hist(grupo_df['pesos'], edgecolor='black', linewidth=0.5)
+    ax[0][0].set_xlim((0,3))
+    ax[0][0].set_title(f'Weights for {grupo}', fontsize=22)  
+    ax[0][0].set_xlabel('Weights', fontsize=20)
+    ax[0][0].set_ylabel('Frequency', fontsize=20)
+    desviacion = statistics.pstdev(grupo_df['pesos'])
+    ax[0][0].text(0.7, 0.8, f'Standard Deviation: {desviacion:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='red')
+    media_peso = np.mean(grupo_df['pesos'])
+    ax[0][0].text(0.7, 0.9, f'Mean: {media_peso:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='magenta')
+    mediana_peso = np.median(grupo_df['pesos'])
+    ax[0][0].text(0.7, 0.85, f'Median: {mediana_peso:.2f}', transform=ax[0][0].transAxes, ha='center', va='center', fontsize=16, color='blue')
+    
+    #Iteramos sobre cada categoría de incidencia 
+    colores = sns.color_palette("viridis", n_colors=len(['Very Low', 'Low', 'Medium', 'High', 'Very High']))
+    for i, categoria in enumerate (['Very Low', 'Low', 'Medium', 'High', 'Very High']):
+        datos_categoria=grupo_df[grupo_df['categoria_incidencia'] == categoria]
+        color_categoria=colores[i]
+        ax[a][b].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=color_categoria, label=categoria)
+        ax[a][b].set_xlim((0,3))
+        ax[a][b].set_ylim(bottom=0) 
+        ax[a][b].set_title(f'{categoria} Incidence', fontsize=22)  
+        ax[a][b].set_xlabel('Weights', fontsize=20)
+        ax[a][b].set_ylabel('Frequency', fontsize=20)
+        #ax[a][b].legend()
+        
+        # Calculamos y mostramos la media y la mediana
+        media_peso = np.mean(datos_categoria['pesos'])
+        mediana_peso = np.median(datos_categoria['pesos'])
+        
+        # Verificamos si hay datos antes de calcular la desviación
+        if not datos_categoria.empty:
+            desviacion = statistics.pstdev(datos_categoria['pesos'])
+            ax[a][b].text(0.7, 0.8, f'Standard Deviation: {desviacion:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='red')
+        else:
+            ax[a][b].text(0.7, 0.8, 'No data', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='red')
+
+        # Mostramos la media y la mediana en el subgráfico
+        ax[a][b].text(0.7, 0.9, f'Mean: {media_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='magenta')
+        ax[a][b].text(0.7, 0.85, f'Median: {mediana_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=15, color='blue')
+        
+        # Mostramos la media y la mediana en el subgráfico
+        #ax[a][b].text(0.7, 0.9, f'Media: {media_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='magenta')
+        #ax[a][b].text(0.7, 0.85, f'Mediana: {mediana_peso:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='blue')
+        #ax[a][b].text(0.7, 0.8, f'Desviación: {desviación:.2f}', transform=ax[a][b].transAxes, ha='center', va='center', fontsize=10, color='red')
+        print(f'Media de pesos para {categoria} en {dia}: {media_peso:.2f}')
+        print(f'Mediana de pesos para {categoria} en {dia}: {mediana_peso:.2f}')
+        
+        if b<2:
+            b+=1
+        elif b == 2:
+            a+=1
+            b=0
+    
+    
+for grupo, dias in grupos_dias.items():
+    a=0
+    b=1
+    grupo_df=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(dias)].copy()
+    
+    
+    fig,ax = plt.subplots(2,2, figsize=(23, 15))
+    fig.suptitle(f'Weight Analysis by Groups: {grupo}', y=1, fontsize=22)
+    plt.subplots_adjust(hspace=0.3, wspace=0.3)
+    ax[0][0].hist(grupo_df['pesos'], edgecolor='black', linewidth=0.5)
+    ax[0][0].set_xlim((0,3))
+    ax[0][0].set_title(f'Weights for {grupo}', fontsize=22)  
+    ax[0][0].set_xlabel('Weights', fontsize=20)
+    ax[0][0].set_ylabel('Frequency', fontsize=20)
+    
+    colores = sns.color_palette("viridis", n_colors=3)
+    
+    # Filtramos datos para incidencias 'Baja', 'Media' y 'Alta'
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['Low', 'Medium', 'High'])]
+    
+    # Subplot para incidencia Baja, Media y Alta
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['Low', 'Medium', 'High'])]
+    ax[1][0].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=colores[2])
+    ax[1][0].set_xlim((0,3))
+    ax[1][0].set_ylim(bottom=0) 
+    ax[1][0].set_title('Low-Medium-High Incidence', fontsize=22)  
+    ax[1][0].set_xlabel('Weights', fontsize=20)
+    ax[1][0].set_ylabel('Frequency', fontsize=20)
+    
+    # Calcular y mostrar la media y la mediana para Incidencia Baja-Media-Alta
+    media_bma = datos_categoria['pesos'].mean()
+    mediana_bma = datos_categoria['pesos'].median()
+    ax[1][0].axvline(x=media_bma, color='magenta', linestyle='--', label=f'Mean: {media_bma:.2f}')
+    ax[1][0].axvline(x=mediana_bma, color='blue', linestyle='--', label=f'Median: {mediana_bma:.2f}')
+    ax[1][0].legend(fontsize='x-large')
+    
+    datos_fechas_casos.loc[datos_categoria.index, 'mediana_categoria']=mediana_bma
+    
+    # Iteramos sobre las categorías restantes
+    for i, categoria in enumerate(['Very Low', 'Very High']):
+        
+        # Filtramos datos por categoría
+        datos_categoria = grupo_df[grupo_df['categoria_incidencia'] == categoria]
+    
+        #Incidencia Muy Baja
+        ax[a][b].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=colores[i])
+        ax[a][b].set_xlim((0,3))
+        ax[a][b].set_ylim(bottom=0) 
+        ax[a][b].set_title(f'{categoria} Incidence', fontsize=22)  
+        ax[a][b].set_xlabel('Weights', fontsize=20)
+        ax[a][b].set_ylabel('Frequency', fontsize=20)
+    
+        # Calcular y mostrar la media y la mediana para Incidencia Muy Baja
+        media_categoria= datos_categoria['pesos'].mean()
+        mediana_categoria = datos_categoria['pesos'].median()
+        #random
+        ax[a][b].axvline(x=media_categoria, color='magenta', linestyle='--', label=f'Mean: {media_categoria:.2f}')
+        ax[a][b].axvline(x=mediana_categoria, color='blue', linestyle='--', label=f'Median: {mediana_categoria:.2f}')
+        ax[a][b].legend(fontsize='x-large')
+        
+        datos_fechas_casos.loc[datos_categoria.index, 'mediana_categoria']=mediana_categoria
+        
+        if b == 1:
+            a+=1
+    
+    fig.savefig(f'histograma_pesos_{grupo}_incidencia_casos_suav.png', dpi=600, format='png')
+    
+for grupo, dias in grupos_dias.items():
+    a=0
+    b=1
+    grupo_df=datos_fechas_casos[datos_fechas_casos['dia_semana'].isin(dias)].copy()
+    
+    
+    fig,ax = plt.subplots(2,2, figsize=(23, 15))
+    fig.suptitle(f'Weight Analysis by Groups: {grupo}', y=1, fontsize=30)
+    plt.subplots_adjust(hspace=0.3, wspace=0.3)
+    for row in ax:
+        for subplot in row:
+            subplot.tick_params(axis='both', labelsize=25)
+    ax[0][0].hist(grupo_df['pesos'], edgecolor='black', linewidth=0.5)
+    ax[0][0].set_xlim((0,3))
+    ax[0][0].set_title(f'Weights for {grupo}', fontsize=22)  
+    ax[0][0].set_xlabel('Weights', fontsize=20)
+    ax[0][0].set_ylabel('Frequency', fontsize=20)
+    
+    colores = sns.color_palette("viridis", n_colors=3)
+    
+    # Filtramos datos para incidencias 'Baja', 'Media' 
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['Low', 'Medium'])]
+    
+    # Subplot para incidencia Baja, Media 
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['Low', 'Medium'])]
+    ax[1][0].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=colores[2])
+    ax[1][0].set_xlim((0,3))
+    ax[1][0].set_ylim(bottom=0) 
+    ax[1][0].set_title('Low - Medium Incidence', fontsize=22)  
+    ax[1][0].set_xlabel('Weights', fontsize=20)
+    ax[1][0].set_ylabel('Frequency', fontsize=20)
+    
+    # Calcular y mostrar la media y la mediana para Incidencia Baja-Media
+    media_bma = datos_categoria['pesos'].mean()
+    mediana_bma = datos_categoria['pesos'].median()
+    ax[1][0].axvline(x=media_bma, color='magenta', linestyle='--', label=f'Mean: {media_bma:.2f}')
+    ax[1][0].axvline(x=mediana_bma, color='blue', linestyle='--', label=f'Median: {mediana_bma:.2f}')
+    ax[1][0].legend(fontsize= 28, loc='best')
+    
+    datos_fechas_casos.loc[datos_categoria.index, 'mediana_categoria']=mediana_bma
+    
+    # Filtramos datos para incidencias 'Alta' 'Muy Alta' 
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['High', 'Very High'])]
+    
+    # Subplot para incidencia Alta y Muy Alta
+    datos_categoria=grupo_df[grupo_df['categoria_incidencia'].isin(['High', 'Very High'])]
+    ax[1][1].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=colores[1])
+    ax[1][1].set_xlim((0,3))
+    ax[1][1].set_ylim(bottom=0) 
+    ax[1][1].set_title('High - Very High Incidence', fontsize=22)  
+    ax[1][1].set_xlabel('Weights', fontsize=20)
+    ax[1][1].set_ylabel('Frequency', fontsize=20)
+    
+    # Calcular y mostrar la media y la mediana para Incidencia Baja-Media-Alta
+    media_bma = datos_categoria['pesos'].mean()
+    mediana_bma = datos_categoria['pesos'].median()
+    ax[1][1].axvline(x=media_bma, color='magenta', linestyle='--', label=f'Mean: {media_bma:.2f}')
+    ax[1][1].axvline(x=mediana_bma, color='blue', linestyle='--', label=f'Median: {mediana_bma:.2f}')
+    ax[1][1].legend(fontsize= 28, loc='best')
+    
+    datos_fechas_casos.loc[datos_categoria.index, 'mediana_categoria']=mediana_bma
+    
+    # Iteramos sobre las categorías restantes
+    for i, categoria in enumerate(['Very Low']):
+        
+        # Filtramos datos por categoría
+        datos_categoria = grupo_df[grupo_df['categoria_incidencia'] == categoria]
+    
+        #Incidencia Muy Baja
+        ax[a][b].hist(datos_categoria['pesos'], edgecolor='black', linewidth=0.5, color=colores[i])
+        ax[a][b].set_xlim((0,3))
+        ax[a][b].set_ylim(bottom=0) 
+        ax[a][b].set_title(f'{categoria} Incidence', fontsize=22)  
+        ax[a][b].set_xlabel('Weights', fontsize=20)
+        ax[a][b].set_ylabel('Frequency', fontsize=20)
+    
+        # Calcular y mostrar la media y la mediana para Incidencia Muy Baja
+        media_categoria= datos_categoria['pesos'].mean()
+        mediana_categoria = datos_categoria['pesos'].median()
+        #random
+        ax[a][b].axvline(x=media_categoria, color='magenta', linestyle='--', label=f'Mean: {media_categoria:.2f}')
+        ax[a][b].axvline(x=mediana_categoria, color='blue', linestyle='--', label=f'Median: {mediana_categoria:.2f}')
+        ax[a][b].legend(fontsize=28, loc='best')
+        
+        datos_fechas_casos.loc[datos_categoria.index, 'mediana_categoria']=mediana_categoria
+        
+        if b == 1:
+            a+=1
+    
+    fig.savefig(f'histograma_pesos_{grupo}_incidencia_casos_suav.png', dpi=600, format='png')
+
+
+# peso random para cada día(para todos los lunes, para )
+# Crear una columna vacía llamada 'pesos_rand'
+datos_fechas_casos['pesos_rand'] = np.nan
+N = 100
+for i in range(len(datos_fechas_casos)):
+    #if datos_fechas_casos['casos'].iloc[i] >= N:
+        datos_fechas_casos['pesos_rand'].iloc[i] = np.random.normal(loc = datos_fechas_casos['mediana_categoria'].iloc[i], scale = 1/datos_fechas_casos['casos'].iloc[i])
+    #else:
+     #   datos_fechas_casos['pesos_rand'].iloc[i] = datos_fechas_casos['mediana_categoria'].iloc[i].copy()
+        
+
+# Una vez hemos obtenido los pesos(media o mediana/pesos rand) para cada tipo de día y cada tipo de incidencia calculamos los casos pesados = casos/pesos
+datos_fechas_casos['casos_pesados']=datos_fechas_casos['casos']/datos_fechas_casos['pesos_rand']
+
+# Verificamos si hay valores NaN en la columna 'casos_pesados'
+if datos_fechas_casos['casos_pesados'].isna().any():
+    # Reemplaza los valores NaN en 'casos_pesados' con los valores de 'casos'
+    datos_fechas_casos.loc[np.isnan(datos_fechas_casos['casos_pesados']), 'casos_pesados'] = datos_fechas_casos['casos']
+
+
+max_value = np.argmax(datos_fechas_casos['casos_pesados']) 
+i =datos_fechas_casos.iloc[max_value]
+#i = datos_fechas_casos['casos_pesados'].index(max_value)
+#posicion = datos_fechas_casos.find('casos_pesados')  
+# Datos de casos pesados para el año 2022
+#datos_pesados_2022 = datos_fechas_casos.loc['2022-11-30':'2022-12-15', 'casos_pesados'].dropna()
+# Desviación estándar inversamente proporcional a los diagnósticos registrados (evitamos divisiones por cero)
+#desviacion_estandar_proporcional = 1 / np.maximum(datos_pesados_2022,1)
+# Ajuste de la distribución gaussiana
+#media, desviacion_estandar = norm.fit(datos_pesados_2022)
+#media = np.mean(datos_pesados_2022)
+# Generación de datos sintéticos
+#datos_sinteticos = np.random.normal(loc=media, scale=desviacion_estandar_proporcional, size=len(datos_pesados_2022))
+# Histograma de datos originales y ajuste gaussiano
+#plt.hist(datos_pesados_2022, bins=30, density=True, alpha=0.6, color='b', label='Datos Originales')
+#plt.hist(datos_sinteticos, bins=30, density=True, alpha=0.6, color='r', label='Distribución Gaussiana Ajustada')
+#plt.legend()
+#plt.xlabel('Casos Pesados')
+#plt.ylabel('Densidad/Frecuencia')
+#plt.title('Comparación entre Datos Originales y Distribución Gaussiana Ajustada')
+#plt.show()
+
+# Usamos la distribución gaussiana ajustada para sustituir los valores de casos pesados en el año 2022 en el conjunto de datos original
+#datos_fechas_casos.loc['2022-11-30':'2022-12-15', 'casos_pesados'] = datos_sinteticos
+        
+# Casos pesados filtrados
+#datos_fechas_casos['casos_pesados_filtrados'] = pd.Series()
+datos_fechas_casos['casos_pesados_filtrados']=datos_fechas_casos['casos_pesados'].rolling(window=7, center=True, min_periods=1).mean()
+#window_7 = (datos_fechas_casos.index < '2023-01-01') | (datos_fechas_casos.index > '2023-12-31')
+#datos_fechas_casos.loc[window_7, 'casos_pesados_filtrados'] = datos_fechas_casos.loc[window_7, 'casos_pesados'].rolling(window=7, center=True, min_periods=1).mean()
+window_14 = datos_fechas_casos.index >= '2023-01-01'  #| (datos_fechas_casos.index <= '2023-12-31')
+datos_fechas_casos.loc[window_14, 'casos_pesados_filtrados'] = datos_fechas_casos.loc[window_14, 'casos_pesados'].rolling(window=14, center=True, min_periods=1).mean()
+
+# Cambiamos manualmente algunos puntos de la temporada 23-24 (las decimas no importan)
+datos_fechas_casos.loc['2023-12-26', 'casos_pesados_filtrados'] = 2150.227409
+datos_fechas_casos.loc['2023-12-31', 'casos_pesados_filtrados'] = 2572.227409
+datos_fechas_casos.loc['2024-01-01', 'casos_pesados_filtrados'] = 2574.227409
+datos_fechas_casos.loc['2024-01-02', 'casos_pesados_filtrados'] = 2576.227409
+datos_fechas_casos.loc['2024-01-03', 'casos_pesados_filtrados'] = 2578.227409
+datos_fechas_casos.loc['2024-01-07', 'casos_pesados_filtrados'] = 2400.227409
+datos_fechas_casos.loc['2024-01-08', 'casos_pesados_filtrados'] = 2350.227409
+datos_fechas_casos.loc['2023-12-01', 'casos_pesados_filtrados'] = 650.227409
+datos_fechas_casos.loc['2023-12-02', 'casos_pesados_filtrados'] = 653.227409
+datos_fechas_casos.loc['2023-12-03', 'casos_pesados_filtrados'] = 662.227409
+datos_fechas_casos.loc['2023-12-04', 'casos_pesados_filtrados'] = 670.227409
+datos_fechas_casos.loc['2023-12-05', 'casos_pesados_filtrados'] = 673.227409
+datos_fechas_casos.loc['2023-12-06', 'casos_pesados_filtrados'] = 680.227409
+datos_fechas_casos.loc['2023-12-07', 'casos_pesados_filtrados'] = 700.227409
+datos_fechas_casos.loc['2023-12-08', 'casos_pesados_filtrados'] = 720.227409
+datos_fechas_casos.loc['2023-12-09', 'casos_pesados_filtrados'] = 800.227409
+datos_fechas_casos.loc['2023-12-10', 'casos_pesados_filtrados'] = 850.227409
+datos_fechas_casos.loc['2023-12-11', 'casos_pesados_filtrados'] = 900.227409
+datos_fechas_casos.loc['2023-12-12', 'casos_pesados_filtrados'] = 910.227409
+datos_fechas_casos.loc['2023-12-13', 'casos_pesados_filtrados'] = 950.227409
+datos_fechas_casos.loc['2023-12-14', 'casos_pesados_filtrados'] = 1000.227409
+
+# Graficamos temporada 23-24
+fig, ax = plt.subplots(figsize=(10, 6))
+
+#datos_post_2023 = datos_fechas_casos.loc[datos_fechas_casos.index > '2023-11-01']
+datos_rango_especifico = datos_fechas_casos.loc['2023-11-30':'2024-01-20']
+ax.plot(datos_rango_especifico.index, datos_rango_especifico['casos_pesados_filtrados'], 'o', color='black', markersize=3)
+ax.set_xlabel('Fecha')
+ax.set_ylabel('Casos Pesados Filtrados')
+ax.set_title('Casos Pesados Filtrados Después de 2023')
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+
+
+# Representación
+
+# Representación   casos reales y casos pesados filtrados  
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(datos_fechas_casos.index, datos_fechas_casos['casos'], linestyle='-', alpha = 0.7, linewidth=0.8, label='Real Cases')
+ax.plot(datos_fechas_casos.index, datos_fechas_casos['casos_pesados_filtrados'], linestyle='-', linewidth=2, label='Filtered Weighted Cases')
+ax.set_title('Real Cases vs Filtered Weighted Cases', fontsize = 22)
+ax.set_xlabel('Date', fontsize = 20)
+ax.set_ylabel('Cases', fontsize = 20)
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Representación    casos filtrados del principio y casos pesados filtrados
+fig, ax = plt.subplots(figsize=(12, 6))
+ax.plot(datos_fechas_casos.index, datos_fechas_casos['casos_suavizados'], linestyle='-', alpha = 0.7, linewidth=0.8, label='Filtered Cases')
+ax.plot(datos_fechas_casos.index, datos_fechas_casos['casos_pesados_filtrados'], linestyle='-', linewidth=2, label='Filtered Weighted Cases')
+ax.set_title('Filtered cases vs Filtered Weighted Cases', fontsize = 22)
+ax.set_xlabel('Date', fontsize = 20)
+ax.set_ylabel('Cases', fontsize = 20)
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+# Filtrar datos desde el 1 de noviembre hasta el 1 de abril
+start_date = '2018-11-01'
+end_date = '2019-04-01'
+datos_fechas_casos_filtrados_18_19 = datos_fechas_casos[(datos_fechas_casos.index >= start_date) & (datos_fechas_casos.index <= end_date)]
+
+# Representación gráfica
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.plot(datos_fechas_casos_filtrados_18_19.index, datos_fechas_casos_filtrados_18_19['casos'], linestyle='-', alpha=0.7, linewidth=0.8, label='Real Cases')
+ax.plot(datos_fechas_casos_filtrados_18_19.index, datos_fechas_casos_filtrados_18_19['casos_pesados_filtrados'], linestyle='-', linewidth=2, label='Filtered Weighted Cases')
+# Ajustar el tamaño de los números en los ejes x e y
+ax.tick_params(axis='x', labelsize=14)  # Tamaño de los números en el eje x
+ax.tick_params(axis='y', labelsize=14)  # Tamaño de los números en el eje y
+ax.set_xlabel('Date', fontsize=20)
+ax.set_ylabel('Cases', fontsize=20)
+ax.legend(fontsize = 16)
+plt.tight_layout()
+plt.show()
+    
+fig, ax = plt.subplots(1, 4, figsize=(30, 10))
+graficos = ['Casos SIVIC', 'Casos Filtrados', 'Casos Pesados', 'Casos Pesados Filtrados']
+datos = [datos_fechas_casos['casos'], datos_fechas_casos['casos_suavizados'], datos_fechas_casos['casos_pesados'], datos_fechas_casos['casos_pesados_filtrados']]
+
+for i in range(4):
+    ax[i].plot(datos_fechas_casos.index, datos[i], linestyle='-', linewidth=0.8)
+    ax[i].set_title(graficos[i])
+    ax[i].set_xlabel('Fecha')
+    ax[i].set_ylabel(graficos[i])
+    ax[i].set_ylim(0, 6000)
+    
+#fig.savefig('casos_sivic_casos_pesados_casos_pesados_filtrados.png', dpi=600, format='png')
+plt.tight_layout()
+plt.show()
+
+
+plt.figure()
+plt.plot(datos_fechas_casos.index, datos_fechas_casos['casos_pesados'], linestyle='-', linewidth=0.8)
+plt.title('Casos Pesados')
+plt.xlabel('Fecha')
+plt.ylabel('Casos Pesados') 
+
+
+# Crear un nuevo DataFrame con las columnas de fecha y casos pesados filtrados
+nuevo_df = datos_fechas_casos['casos_pesados_filtrados'].copy()
+
+ruta='C:/Users/Elena/Desktop/TFG/mes 1/datos/datos_procesados.csv'
+# Guardar el DataFrame en un archivo CSV
+nuevo_df.to_csv(ruta, index=True)
+
+ruta_2 = 'C:/Users/Elena/Desktop/TFG/mes 1/datos/datos_fechas_casos.csv'
+datos_fechas_casos.to_csv(ruta_2, index = True)
+
+# Machine Learning
+
+# Descomposition of our time series into trend, seasonality and noise
+def decompose_time_series(datos_fechas_casos, share_type='casos_pesados_filtrados', samples=all, period=365):
+    res = seasonal_decompose(datos_fechas_casos[share_type].values, period=period)
+    
+    observed = res.observed
+    trend = res.trend
+    seasonal = res.seasonal
+    residual = res.resid
+    
+    #plot the complete time series
+    fig, ax = plt.subplots(4, figsize=(16,8))
+    ax[0].set_title('Observed', fontsize=16)
+    ax[0].plot(observed)
+    ax[0].grid()
+    
+    #plot the trend of the time series
+    ax[1].set_title('Trend', fontsize=16)
+    ax[1].plot(trend)
+    ax[1].grid()
+    
+    #plot the seasonality of the time series. Period = 365 days
+    ax[2].set_title('Seasonality', fontsize=16)
+    ax[2].plot(seasonal)
+    ax[2].grid()
+    
+    #plot the noise of the time series
+    ax[3].set_title('Noise', fontsize=16)
+    ax[3].plot(residual)
+    #ax[3].scatter(y=residual, x=range(len(residual)), alpha=0.5)
+    ax[3].grid()
+decompose_time_series(datos_fechas_casos, share_type='casos_pesados_filtrados')
+
+# Autocorrelation
+#plt.figure(figsize=(12, 6))
+#plot_acf(datos_fechas_casos['casos_pesados_filtrados'], lags=365)  # Lags para un año
+#plt.title('Autocorrelation Function (Daily Lag)')
+#plt.show()
+
+# Predicting our horizon
+
+# Primer Modelo, usando X_train y_train y X_test(siguiente objetivo es no tener que usar X_test) y y_test
+
+def train_time_series_with_folds(datos_fechas_casos, horizon=365):
+    # Separamos variables categóricas y numéricas
+    categorical_cols = ['dia_semana', 'categoria_incidencia']
+    #numerical_cols = datos_fechas_casos.columns.difference(categorical_cols)
+
+    # Codificar one-hot las variables categóricas
+    encoded_data = pd.get_dummies(datos_fechas_casos, columns=categorical_cols)
+    
+    # Separamos características y etiquetas
+    X = encoded_data.drop('casos_pesados_filtrados', axis=1)
+    y = encoded_data['casos_pesados_filtrados']
+    
+    # We take last week of the dataset for validation
+    X_train, X_test = X.iloc[:-horizon, :], X.iloc[-horizon:, :]
+    y_train, y_test = y.iloc[:-horizon], y.iloc[-horizon:]
+    
+    # Creamos una lista con los nombres de las columnas categóricas
+    #categorical_cols = ['dia_semana', 'categoria_incidencia']
+    #lgb_train = lgb.Dataset(X_train, label=y_train, categorical_feature=categorical_cols)
+    
+    # Configurar los parámetros del modelo
+    #params = {
+    #'objective': 'regression',
+    #'metric': 'mae',
+    #'boosting_type': 'gbdt',
+    #'num_leaves': 31,
+    #'learning_rate': 0.05,
+    #}
+    
+    # Entrenar el modelo
+    #model = lgb.train(params, lgb_train, num_boost_round=100)
+    
+    # create, train and do inference of the model
+    model = LGBMRegressor(random_state=42)
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+    
+    # We calculate MAE
+    mae = np.round(mean_absolute_error(y_test, predictions), 3)
+
+    # plot reality vs prediction for the last year of the dataset
+    plt.figure(figsize=(16,8))
+    plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+    plt.plot(y_test, color='magenta', label='Real cases')
+    plt.plot(pd.Series(predictions, index=y_test.index), color='green', label='Predicted cases')
+    plt.xlabel('Day', fontsize=16)
+    plt.ylabel('Number of cases', fontsize=16)
+    plt.legend()
+    plt.grid()
+    plt.show()
+    
+train_time_series_with_folds(datos_fechas_casos)
+
+pd.set_option('display.max_columns', None)
+datos_fechas_casos.head()
+
+# Segundo Modelo
+
+df_2 = pd.DataFrame()
+# Columna y debe ser numérica y representa la medida que deseamos pronosticar
+df_2['y'] = datos_fechas_casos['casos_pesados_filtrados']
+# ds es columna de fechas y debe tener formato AAAA-MM-DD
+df_2['ds']=df_2.index
+
+
+
+# Filtrar el DataFrame de datos_fechas_casos para incluir solo los datos a partir de 2012 & hasta 2018
+df_2=df_2[(df_2.index.year >= 2012) & (df_2.index <= '2018-06-01')]
+#df_2=df_2[(df_2.index.year >= 2012) & (df_2.index.year <= 2018)]
+m = Prophet()
+m.fit(df_2)
+
+# 2.1. Aquí también hace predicciones de los datos históricos (puede haber un sobreajuste)
+#future = m.make_future_dataframe(periods=365)
+#future.tail()
+
+# Pero si queremos que solo haga las predicciones para el año 2019
+future_dates_2019 = pd.date_range(start='2018-06-02', end='2019-12-31', freq='D')
+#future_dates_2019 = pd.date_range(start='2019-01-01', end='2019-12-31', freq='D')
+future_2019 = pd.DataFrame({'ds': future_dates_2019})
+
+# Realizamos las predicciones solo para el año 2019
+forecast_2019 = m.predict(future_2019)
+forecast_2019[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail()
+
+#predictions=pd.DataFrame()
+#predictions['y_test']=forecast['yhat']
+#predictions['fecha']=forecast['ds']
+#predictions.set_index("fecha", inplace=True)
+#predictions=predictions[(predictions.index.year == 2019)]
+
+y_test=pd.DataFrame()
+y_test=datos_fechas_casos['casos_pesados_filtrados']
+y_test=y_test[(y_test.index >= '2018-06-02') & (y_test.index <= '2019-12-31')]
+#y_test = y_test[y_test.index.year == 2019]
+forecast_2019.index=y_test.index
+
+# We calculate MAE
+mae = np.round(mean_absolute_error(y_test, forecast_2019['yhat']), 3)
+
+# plot reality vs prediction for the last year of the dataset
+plt.figure(figsize=(16,8))
+plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+plt.plot(y_test, color='magenta', label='Real cases')
+plt.plot(forecast_2019['yhat'], color='green', label='Predicted cases')
+plt.xlabel('Day', fontsize=16)
+plt.ylabel('Number of cases', fontsize=16)
+plt.legend()
+plt.grid()
+plt.show()
+
+# 2.2 Probamos el segundo modelo pero "prediciendo" también los datos históricos
+# En realidad no predice el modelo, sino que te enseña como se ajusta de bien el modelo durante el entrenamiento
+#m = Prophet(seasonality_mode='multiplicative')
+df_2=df_2[(df_2.index.year >= 2012) & (df_2.index.year <= 2018)]
+m = Prophet()
+m.fit(df_2)
+
+future = m.make_future_dataframe(periods=365)
+#future.tail()
+y_test_2 = datos_fechas_casos['casos_pesados_filtrados']
+y_test_2 = y_test_2[(y_test_2.index.year >= 2012) & (y_test_2.index.year <= 2019)]
+forecast = m.predict(future)
+forecast.index = y_test_2.index
+
+# We calculate MAE
+mae = np.round(mean_absolute_error(y_test_2, forecast['yhat']), 3)
+
+plt.figure(figsize=(16,8))
+plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+plt.plot(y_test_2, color='magenta', label='Real cases')
+plt.plot(forecast['yhat'], color='green', label='Predicted cases')
+plt.xlabel('Day', fontsize=16)
+plt.ylabel('Number of cases', fontsize=16)
+plt.legend()
+plt.grid()
+plt.show()
+
+# Trazamos el pronóstico
+fig1 = m.plot(forecast)
+plt.title('Pronóstico con Prophet')
+plt.xlabel('Fecha')
+plt.ylabel('Valor Pronosticado')
+plt.legend(loc='upper left')
+plt.show()
+
+fig2 = m.plot_components(forecast) 
+
+# Ahora usamos cross validation
+m = Prophet()
+m.fit(df_2)
+df_cv = cross_validation(m, initial='730 days', period='365 days', horizon = '365 days')
+df_cv.head()
+
+# calculamos algunas estadísticas útiles del rendimiento de la predicción
+df_metricas = performance_metrics(df_cv)
+df_metricas.head()
+
+fig = plot_cross_validation_metric(df_cv, metric='mape')
+
+# Usaremos el mismo modelo 2.2 pero ahora ajustando los hiperparámetros
+#m = Prophet(scaling='minmax')#seasonality_mode = 'multiplicative')
+df_2=df_2[(df_2.index.year >= 2012) & (df_2.index.year <= 2018)]
+m = Prophet(seasonality_mode = 'multiplicative')
+m.fit(df_2)
+
+future = m.make_future_dataframe(periods=365)
+#future.tail()
+y_test_2 = datos_fechas_casos['casos_pesados_filtrados']
+y_test_2 = y_test_2[(y_test_2.index.year >= 2012) & (y_test_2.index.year <= 2019)]
+forecast = m.predict(future)
+forecast.index = y_test_2.index
+
+# We calculate MAE
+mae = np.round(mean_absolute_error(y_test_2, forecast['yhat']), 3)
+
+plt.figure(figsize=(16,8))
+plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+plt.plot(y_test_2, color='magenta', label='Real cases')
+plt.plot(forecast['yhat'], color='green', label='Predicted cases')
+plt.xlabel('Day', fontsize=16)
+plt.ylabel('Number of cases', fontsize=16)
+plt.legend()
+plt.grid()
+plt.show()
+
+# Prophet
+# Calaculamos el error viendo la diferencia de magnitud entre el pico de datos reales y el pico de datos de prediccion, 
+# y también vemos el error en "anchura", es decir, cuantos días de adelanta o se atrasa el pico de predicción respecto el pico real
+# Pero lo haremos solo para el año 2019 y vamos a empezar la predicción en '2018-09-03'
+
+df_2 = pd.DataFrame()
+# Columna y debe ser numérica y representa la medida que deseamos pronosticar
+df_2['y'] = datos_fechas_casos['casos_pesados_filtrados']
+# ds es columna de fechas y debe tener formato AAAA-MM-DD
+df_2['ds']=df_2.index
+df_2=df_2[(df_2.index >= '2014-09-01') & (df_2.index <= '2018-09-02')]
+#changepoints = ['2014-12-01', '2015-12-01','2016-12-01', '2017-12-01']
+#changepoint_range = 0.25
+m = Prophet(seasonality_mode = 'multiplicative', changepoint_prior_scale = 0.01)
+m.fit(df_2)
+
+# Generar las fechas futuras para las predicciones
+start_date = pd.to_datetime('2018-09-03')
+end_date = pd.to_datetime('2019-04-14')
+
+# Definir el intervalo inicial de 14 días
+interval_start = start_date
+interval_end = start_date + pd.Timedelta(days=13)
+
+predictions = []
+while interval_start <= end_date:
+    # Crear un DataFrame con el rango de fechas para el próximo intervalo de 14 días
+    future_chunk = pd.DataFrame({'ds': pd.date_range(start=interval_start, end=interval_end)})
+    
+    # Hacer predicciones para el intervalo de 14 días
+    forecast_chunk = m.predict(future_chunk)
+    predictions.append(forecast_chunk)
+    
+    # Actualizar el DataFrame de entrenamiento para incluir los datos reales del intervalo anterior
+    if interval_end <= end_date:
+        new_data = datos_fechas_casos.loc[:interval_end]
+        new_data_prophet = pd.DataFrame({'ds': new_data.index, 'y': new_data['casos_pesados_filtrados']})
+        m = Prophet(seasonality_mode='multiplicative', changepoint_prior_scale=0.02)
+        m.fit(new_data_prophet)
+        
+    #Mover el intervalo 14 días hacia adelante
+    interval_start = interval_start + pd.Timedelta(days=14)
+    interval_end = interval_end + pd.Timedelta(days=14)
+    
+# Concatenar todas las predicciones
+forecast_2019 = pd.concat(predictions)
+
+
+
+
+future_dates_2019 = pd.date_range(start='2018-09-03', end='2019-04-14', freq='D')
+future_2019 = pd.DataFrame({'ds': future_dates_2019})
+forecast_2019 = m.predict(future_2019)
+
+
+y_test=pd.DataFrame()
+y_test=datos_fechas_casos['casos_pesados_filtrados']
+y_test=y_test[(y_test.index >= '2018-09-03') & (y_test.index <= '2019-04-14')]
+
+forecast_2019.index=y_test.index
+
+mae = np.round(mean_absolute_error(y_test, forecast_2019['yhat']), 3)
+
+# plot reality vs prediction for the last year of the dataset
+plt.figure(figsize=(16,8))
+plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+plt.plot(y_test, color='magenta', label='Real cases')
+plt.plot(forecast_2019['yhat'], color='green', label='Predicted cases')
+plt.xlabel('Day', fontsize=16)
+plt.ylabel('Number of cases', fontsize=16)
+plt.legend()
+plt.grid()
+plt.show()
+
+# Encuentra el valor máximo en los datos reales y en las predicciones
+real_max = y_test.max()
+predicted_max = forecast_2019['yhat'].max()
+
+# Encuentra los índices de los máximos en los datos reales y en las predicciones
+real_max_index = y_test.idxmax()
+predicted_max_index = forecast_2019.loc[forecast_2019['yhat'] == predicted_max].index[0]
+
+# Calcula la diferencia en magnitud entre los picos
+magnitude_error = np.abs(real_max - predicted_max)
+
+# Calcula la diferencia en días entre los picos
+days_error = (predicted_max_index - real_max_index).days
+
+print("days_error:", days_error)
+print("magnitude_error:", magnitude_error)
+
+# Definimos umbral de casos a partir del cual la incidencia comienza a ser "alta"
+umbral_casos = 500
+
+# Días en los que el número de casos supera el umbral
+dias_umbral_reales = y_test[y_test > umbral_casos]. index
+dias_umbral_predichos = forecast_2019[forecast_2019['yhat'] > umbral_casos]['ds']
+
+# Diferencia en días entre los índices del primer y último día donde el número de casos supera el umbral
+diferencia_anchura_reales = (dias_umbral_reales[-1] - dias_umbral_reales[0]).days
+diferencia_anchura_predichos = (dias_umbral_predichos.iloc[-1]- dias_umbral_predichos.iloc[0]).days
+
+print("Diferencia en 'anchura' entre los picos reales:", diferencia_anchura_reales)
+print("Diferencia en 'anchura' entre los picos predichos:", diferencia_anchura_predichos)
+
+fig2 = m.plot_components(forecast) 
+
+# 2.3 Usando el segundo modelo pero ahora con días festivos
+df_3 = datos_fechas_casos[['casos_pesados_filtrados', 'festivo']].copy()
+df_3.columns = [ 'y', 'festivo']
+df_3['ds'] = df_3.index
+
+df_3=df_3[(df_3.index.year >= 2012) & (df_3.index <= '2018-09-02')]
+
+# Añadimos días festivos al modelo
+dias_festivos = df_3[df_3['festivo']].loc[:,'ds'].values
+festivos = pd.DataFrame({
+    'holiday':'festivo',
+    'ds': pd.to_datetime(dias_festivos), 
+    'lower_window': 0, 
+    'upper_window': 0,
+    })
+
+m = Prophet(holidays=festivos, seasonality_mode='multiplicative', changepoint_prior_scale = 0.02) #seasonality_mode='multiplicative')
+
+m.fit(df_3)
+
+future_dates_2019 = pd.date_range(start='2018-09-03', end='2019-04-14', freq='D')
+future_2019 = pd.DataFrame({'ds': future_dates_2019})
+
+forecast_2019 = m.predict(future_2019)
+
+fig3 = m.plot(forecast)
+plt.title('Pronóstico con Prophet')
+plt.xlabel('Fecha')
+plt.ylabel('Valor Pronosticado')
+plt.legend(loc='upper left')
+plt.show()
+
+fig2 = m.plot_components(forecast) #mirar
+mae = np.round(mean_absolute_error(y_test, forecast_2019['yhat']), 3)
+
+# Y si queremos ver como entrena el modelo con los datos históricos
+#future = m.make_future_dataframe(periods=485)
+#forecast = m.predict(future)
+
+
+
+
+# Tercer modelo: Usamos skforecast
+datos = datos_fechas_casos['casos_pesados_filtrados']
+#datos = datos.asfreq('MS')
+datos = datos.asfreq('MS')
+datos_train = datos[(datos.index >= '2012-06-01') & (datos.index <= '2018-06-01')]
+datos_test = datos[(datos.index >= '2018-06-01') & (datos.index <= '2019-06-01')]
+
+fig, ax = plt.subplots(figsize=(6, 2.5))
+datos_train.plot(ax=ax, label='train')
+datos_test.plot(ax=ax, label='test')
+ax.legend();
+
+# Se crea y entrena forecaster
+forecaster = ForecasterAutoreg(regressor = RandomForestRegressor(max_depth=10, n_estimators=500, random_state=123), lags = 24 )
+forecaster.fit(y=datos_train)
+predicciones = forecaster.predict(steps = len(datos_test))
+predicciones.head()
+
+# Gráfico de predicciones vs valores rales
+fig, ax = plt.subplots(figsize=(6, 2.5))
+datos_train.plot(ax=ax, label='train')
+datos_test.plot(ax=ax, label='test')
+predicciones.plot(ax=ax, label='predicciones')
+ax.legend();
+
+# Error de predicción en los datos de test
+error_mse = mean_squared_error(
+                y_true = datos_test,
+                y_pred = predicciones
+            )
+
+print(f"Error de test (mse): {error_mse}")
+
+# Valores candidatos de lags
+steps = len(datos_test)
+lags_grid = [10,24]
+
+# Valores candidatos de hiperparámetros del regresor
+param_grid = {'n_estimators': [100, 500],
+              'max_depth': [3, 5, 10]}
+
+resultados_grid = grid_search_forecaster(
+                        forecaster         = forecaster,
+                        y                  = datos_train,
+                        param_grid         = param_grid,
+                        lags_grid          = lags_grid,
+                        steps              = steps,
+                        refit              = False,
+                        metric             = 'mean_squared_error',
+                        initial_train_size = int(len(datos_train)*0.5),
+                        fixed_train_size   = False,
+                        return_best        = True,
+                        n_jobs             = 'auto',
+                        verbose            = False
+                  )
+
+# Otra forma
+from sklearn.ensemble import  HistGradientBoostingRegressor
+datos=pd.DataFrame()
+datos = datos_fechas_casos['casos_pesados_filtrados']
+datos = datos.asfreq('D')
+datos_train = datos.loc['2014-09-01':'2017-09-01']
+datos_val = datos.loc['2017-09-02':'2018-09-02']
+datos_test = datos.loc['2018-09-03':'2019-04-14']
+#datos_train = datos[(datos.index.year >= 2012) & (datos.index.year <= 2017)]
+#datos_val =  datos[(datos.index.year >= 2018) & (datos.index <= '2018-10-01' )]
+#datos_test = datos[(datos.index >= '2018-10-02') & (datos.index.year <= 2019)]
+#datos_train = datos[(datos.index.year >= 2012) & (datos.index.year <= 2017)]
+#datos_val =  datos[(datos.index.year == 2018)]
+#datos_test = datos[(datos.index.year == 2019)]
+
+# Usando HistGradientBoosting
+#forecaster = ForecasterAutoreg(regressor = HistGradientBoostingRegressor(), lags = 365*5) 
+#datos_train_val = pd.concat([datos_train, datos_val])     
+#forecaster.fit(y= datos_train_val)   
+
+# Usando Hist pero con ajuste de parámetros 
+#forecaster = ForecasterAutoreg(regressor = HistGradientBoostingRegressor(random_state = 123,
+#                                                                         learning_rate = 0.1,
+#                                                                         max_depth = 3,
+#                                                                        max_iter = 100),
+#                                                    lags = 365) #transformer_y = StandardScaler())
+
+# Usando LGBMR 
+forecaster = ForecasterAutoreg(regressor = LGBMRegressor(),
+                                                       lags = 365)
+
+# Usando LGBMR pero con ajuste de parámetros
+forecaster = ForecasterAutoreg(regressor = LGBMRegressor(max_depth = 10, learning_rate = 0.1, n_estimators = 200, num_leaves = 20),#, max_iter = 500, num_leaves = 30),
+                                                           lags = 365)
+forecaster.fit(y = datos.loc[:'2018-09-02'])
+predicciones = forecaster.predict(len(datos_test))
+#metric, preds = backtesting_forecaster(forecaster = forecaster, y = datos[(datos.index.year >= 2012) & (datos.index.year <= 2019)], initial_train_size = len(datos_train) + len(datos_val), steps = 365, metric = 'mean_absolute_error',
+#                        refit              = False,
+#                        verbose            = False
+#                     )
+
+# Importancia de los predictores
+#forecaster.get_feature_importance().sort_values('importance', ascending = False)
+# We calculate MAE
+mae = np.round(mean_absolute_error(datos_test, predicciones),3)
+
+plt.figure(figsize=(16,8))
+plt.title(f'Real vs Prediction - MAE {mae}', fontsize=20)
+plt.plot(datos_test, color='magenta', label='Real cases')
+plt.plot(predicciones, color='green', label='Predicted cases')
+plt.xlabel('Day', fontsize=16)
+plt.ylabel('Number of cases', fontsize=16)
+plt.legend()
+plt.grid()
+plt.show()
+
+
+
+
+fig, ax = plt.subplots(figsize=(6, 2.5))
+datos_train.plot(ax=ax, label='train')
+datos_val.plot(ax=ax, label='val')
+datos_test.plot(ax=ax, label='test')
+predicciones.plot(ax=ax, label='predicciones')
+ax.legend();
+
+
+lags_grid = [365, 365*2]
+param_grid = {
+    'max_iter': [100, 500],
+    'max_depth': [2, 3, 5, 10, None],
+    'learning_rate': [0.01, 0.1],
+    'n_estimators': [100, 200, 300, 500],
+    'num_leaves': [20, 30, 40]
+}
+
+results_grid = grid_search_forecaster(
+                       forecaster         = forecaster,
+                       y = datos.loc[:'2018-12-31'],
+                       lags_grid          = lags_grid,
+                       param_grid         = param_grid,
+                       steps              = len(datos_test),
+                       metric             = 'mean_absolute_error',
+                       initial_train_size = len(datos_train),
+                       refit              = False,
+                       fixed_train_size   = False,
+                       return_best        = True,
+                       verbose            = False,
+                       show_progress      = False
+                   )
+
+# Encuentra el valor máximo en los datos reales y en las predicciones
+real_max = datos_test.max()
+predicted_max = predicciones.max()
+
+# Encuentra los índices de los máximos en los datos reales y en las predicciones
+real_max_index = datos_test.idxmax()
+predicted_max_index = predicciones.loc[predicciones == predicted_max].index[0]
+
+# Calcula la diferencia en magnitud entre los picos
+magnitude_error = np.abs(real_max - predicted_max)
+
+# Calcula la diferencia en días entre los picos
+days_error = (predicted_max_index - real_max_index).days
+
+print("days_error:", days_error)
+print("magnitude_error:", magnitude_error)
+
+# Definimos umbral de casos a partir del cual la incidencia comienza a ser "alta"
+umbral_casos = 500
+
+# Días en los que el número de casos supera el umbral
+dias_umbral_reales = datos_test[datos_test > umbral_casos]. index
+dias_umbral_predichos = predicciones[predicciones> umbral_casos].index
+
+# Diferencia en días entre los índices del primer y último día donde el número de casos supera el umbral
+diferencia_anchura_reales = (dias_umbral_reales[-1] - dias_umbral_reales[0]).days
+diferencia_anchura_predichos = (dias_umbral_predichos[-1]- dias_umbral_predichos[0]).days
+
+print("Diferencia en 'anchura' entre los picos reales:", diferencia_anchura_reales)
+print("Diferencia en 'anchura' entre los picos predichos:", diferencia_anchura_predichos)
+
+# Incluimos variables exógenas (día de la semana y si es festivo o no)
+
+# Separamos variables categóricas y numéricas
+categorical_cols = ['dia_semana', 'categoria_incidencia']
+#numerical_cols = datos_fechas_casos.columns.difference(categorical_cols)
+
+# Codificar one-hot las variables categóricas
+encoded_data = pd.get_dummies(datos_fechas_casos, columns=categorical_cols)
+
+# Conservar solo las columnas 'casos_pesados_filtrados' y las columnas generadas por la codificación one-hot de los días de la semana
+encoded_data = encoded_data[['casos_pesados_filtrados'] + list(encoded_data.filter(like='dia_semana_').columns)]
+
+# Convertir True y False en 1 y 0
+encoded_data = encoded_data.astype(int)
+
+encoded_data = encoded_data.asfreq('D')
+variables_exog = ['dia_semana_Holiday', 'dia_semana_Monday', 'dia_semana_Tuesday', 
+                  'dia_semana_Wednesday', 'dia_semana_Thursday', 'dia_semana_Friday', 
+                  'dia_semana_Saturday', 'dia_semana_Sunday',]
+forecaster.fit(
+    y = encoded_data.loc[:'2018-10-01', 'casos_pesados_filtrados'],
+    exog = encoded_data.loc[:'2018-10-01', variables_exog]
+    ) # Entrenamiento con conjuntos de train + validación
+
+valor_exog_future= encoded_data[variables_exog][(encoded_data.index >= '2018-10-02') & (encoded_data.index.year <= 2019)]
+predicciones = forecaster.predict(steps = len(datos_test), exog = valor_exog_future)
+
+# DEEP LEARNING
+
+# FORECASTING CON REDES LSTM-PARTE 1: PREPARACIÓN DE LOS DATOS
+
+# Cargar los datos
+datos = datos_fechas_casos['casos_pesados_filtrados']
+
+# Variable a predecir: el número de casos por día
+# Variable predictora: variable de entrada al modelo LSTM, que es el número de casos por día también
+
+# FORECASTING CON REDES LSTM-PARTE 2: MODELO UNIVARIADO-UNISTEP
+
+# 60 registros de entrada y vamos a predecir 1 instante de tiempo en la salida
+
+# Con el set de entrenamiento: ajustamos los parámetros
+# Con el set de validación: afinamos el modelo, ajustamos los hiperparámetros
+# Con el set de prueba: ponemos a prueba el modelo
+
+train = datos.loc[:'2017-06-01']
+val = datos.loc['2017-06-02':'2018-06-02']
+test = datos.loc['2018-06-03':'2019-06-03']
+
+print(f'Tamaño set de entrenamiento: {train.shape}')
+print(f'Tamaño set de validación: {val.shape}')
+print(f'Tamaño set de prueba: {test.shape}')
+
+# Dibujamos los subsets
+fig, ax = plt.subplots(figsize = (16,5))
+ax.plot(train, label = 'Train')
+ax.plot(val, label = 'Val')
+ax.plot(test, label = 'Test')
+plt.legend()
+
+# Generación del dataset supervisado
+
+# Batches de entrada: los registros los partimos en pequeños bloques de 60 días a la entrada y de 1 día a la salida
+# Input_length: número de días consecutivos que vamos a presentar a la entrada del modelo (60 días)
+# Features: características que va a tener cada dato de entrada, en nuestro caso solo usamos 1
+# Batches de salida: número de predicciones, si el dato x de entrada se parte en 50.000 pequeños bloques de 60 días 
+# de entrada a la salida tendremos esa misma cantidad de bloques, esos 50.000 pequeños bloques pero en este caso la segunda
+# dimensión va a ser el output_length (el número de días que queremos predecir a futuro) --> predecimos 1 día a futuro
+# Output_length: 1 día a futuro
+
+# Primer lote de entrenamiento será: del día 1-60 y el día 61 será el dato correspondiente de salida
+# Segundo lote: del día 2-61 y el día 62 será el día que prediga el modelo
+# ... así hasta tomar la totalidad del set de entrenamiento, validación y prueba
+
+def crear_dataset_supervisado(array, input_length, output_length):
+    ''' Parámetros:
+         - array: arreglo numpy de tamaño N x features (N: cantidad de datos, f: cantidad de features)
+         - input_length: instantes de tiempo consecutivos de la serie de tiempo usados para alimentar el modelo
+         - output_length: instantes de tiempo a pronosticar
+         '''
+    
+    # Inicialización
+    X, Y = [], []    # Listados que contendrán los datos de entrada y salida del modelo
+    shape = array.shape
+    if len(shape)==1: # Si tenemos sólo una serie (univariado)
+        fils, cols = array.shape[0], 1
+        array = array.reshape(fils,cols)
+    else: # Multivariado
+        fils, cols = array.shape
+
+    # Generar los arreglos
+    for i in range(fils-input_length-output_length):
+        X.append(array[i:i+INPUT_LENGTH,0:cols]) # 60 días consecutivos
+        Y.append(array[i+input_length:i+input_length+output_length,-1].reshape(output_length,1)) # 1 día
+    
+    # Convertir listas a arreglos de NumPy
+    X = np.array(X)
+    Y = np.array(Y)
+    
+    return X, Y
+
+INPUT_LENGTH = 60 # 60 días
+OUTPUT_LENGTH = 1 # Modelo uni-step
+
+# Datasets supervisados para entrenamiento (x_tr, y_tr), validación
+# (x_vl, y_vl) y prueba (x_ts, y_ts)
+x_tr, y_tr = crear_dataset_supervisado(train.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_vl, y_vl = crear_dataset_supervisado(val.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_ts, y_ts = crear_dataset_supervisado(test.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print('Tamaños entrada (BATCHES x INPUT_LENGTH x FEATURES) y de salida (BATCHES x OUTPUT_LENGTH x FEATURES)')
+print(f'Set de entrenamiento - x_tr: {x_tr.shape}, y_tr: {y_tr.shape}')
+print(f'Set de validación - x_vl: {x_vl.shape}, y_vl: {y_vl.shape}')
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Escalamiento
+
+from sklearn.preprocessing import MinMaxScaler
+
+def escalar_dataset(data_input):
+    ''' Escala el dataset en el rango de -1 a 1.
+    
+    Entradas:
+        data_input: diccionario con los dataset de entrada y salida del modelo
+    Salida:
+        data_scaled: diccionario con los datasets de entrada y salida escalados
+        scaler: el escalador usado (requerido para las predicciones)
+        '''
+    
+    NFEATS = data_input['x_tr'].shape[2]
+
+    # Generar listado con "scalers"
+    scalers = [MinMaxScaler(feature_range=(-1,1)) for i in range(NFEATS)]
+
+    # Arreglos que contendrán los datasets escalados
+    x_tr_s = np.zeros(data_input['x_tr'].shape)
+    x_vl_s = np.zeros(data_input['x_vl'].shape)
+    x_ts_s = np.zeros(data_input['x_ts'].shape)
+    y_tr_s = np.zeros(data_input['y_tr'].shape)
+    y_vl_s = np.zeros(data_input['y_vl'].shape)
+    y_ts_s = np.zeros(data_input['y_ts'].shape)
+
+    # Escalamiento: se usarán los min/max del set de entrenamiento para
+    # escalar la totalidad de los datasets
+
+    # Escalamiento Xs
+    for i in range(NFEATS):
+        x_tr_s[:,:,i] = scalers[i].fit_transform(x_tr[:,:,i])
+        x_vl_s[:,:,i] = scalers[i].transform(x_vl[:,:,i])
+        x_ts_s[:,:,i] = scalers[i].transform(x_ts[:,:,i])
+    
+    # Escalamiento Ys
+    y_tr_s[:,:,0] = scalers[-1].fit_transform(y_tr[:,:,0])
+    y_vl_s[:,:,0] = scalers[-1].transform(y_vl[:,:,0])
+    y_ts_s[:,:,0] = scalers[-1].transform(y_ts[:,:,0])
+
+    # Conformar ` de salida
+    data_scaled = {
+        'x_tr_s': x_tr_s, 'y_tr_s': y_tr_s,
+        'x_vl_s': x_vl_s, 'y_vl_s': y_vl_s,
+        'x_ts_s': x_ts_s, 'y_ts_s': y_ts_s,
+    }
+
+    return data_scaled, scalers[0]
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+# Creación y entrenamiento del modelo
+
+# Entradas: arreglos x
+# Salidas: arreglos y
+
+# Usaremos la raíz cuadrada del error cuadrático medio como pérdida para entrenar el modelo
+# Objetivo: que la pérdida vaya disminuyendo a medida que avanzamos en el entrenamiento
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import RMSprop
+import tensorflow as tf
+
+# Ajustar parámetros para repdoducibilidad del entrenamiento
+tf.random.set_seed(123)
+tf.config.experimental.enable_op_determinism()
+
+# El modelo
+N_UNITS = 128 # Tamaño del estado oculto (h) y de la celda de memoria (c)
+INPUT_SHAPE = (x_tr_s.shape[1], x_tr_s.shape[2]) # cada dato de entrada tiene 60 días x 1 característica
+
+modelo = Sequential()
+modelo.add(LSTM(N_UNITS, input_shape=INPUT_SHAPE))
+modelo.add(Dense(OUTPUT_LENGTH, activation='linear'))
+
+# Pérdida: RMSE para el entrenamiento
+# pues permite tener errores en las mismas unidades de la temperatura
+def root_mean_squared_error(y_true, y_pred):
+    rmse = tf.math.sqrt(tf.math.reduce_mean(tf.square(y_pred-y_true)))
+    return rmse
+
+# Compilación
+optimizador = RMSprop(learning_rate=5e-5)
+modelo.compile(
+    optimizer = optimizador,
+    loss = root_mean_squared_error,
+)
+
+# Entrenamiento
+EPOCHS = 80
+BATCH_SIZE = 256
+historia = modelo.fit(
+    x = x_tr_s,
+    y = y_tr_s,
+    batch_size = BATCH_SIZE,
+    epochs = EPOCHS,
+    validation_data = (x_vl_s, y_vl_s),
+    verbose=2
+)
+
+# Graficar curvas de entrenamiento y validación
+plt.plot(historia.history['loss'], label = 'RMSE train')
+plt.plot(historia.history['val_loss'], label = 'RMSE val')
+plt.xlabel('Iteración')
+plt.ylabel('RMSE')
+plt.legend()
+
+# Predicciones con el modelo entrenado
+def predecir (x, model, scaler):
+    ''' Genera la predicción de OUTPUT_LENGTH instantes de tiempo a futuro con el modelo entrenado
+    
+    Entrada:
+        x: batch(o batches) de datos para ingresar al modelo
+            (tamaño: batches x input_length x features)
+        model: Red LSTM entrenada
+        scaler: escalador
+    
+    Salida:
+        y_pred: la predicción en la escala original (tamaño: batches x output_length x features)
+        '''
+    y_pred_s= model.predict(x,verbose=0)
+    y_pred = scaler.inverse_transform(y_pred_s)
+        
+    return y_pred, y_pred.flatten()
+
+# Calcular predicciones sobre el set de prueba
+y_ts_pred = predecir (x_ts_s, modelo, scaler)
+
+N = len(y_ts_pred) # Número de predicciones
+ndato = np.linspace(1,N,N)
+
+# Cálculo de errores simples
+errores = y_ts.flatten() - y_ts_pred
+plt.plot(errores)
+
+# Graficamos los casos reales y los predichos por el modelo durante ese rango de tiempo
+fechas = datos.loc['2018-08-02':'2019-06-02'].index
+plt.figure(figsize=(10, 6))
+plt.plot(fechas, y_ts.flatten(), label = 'Datos reales')
+plt.plot(fechas, y_ts_pred, label = 'Predicciones')
+plt.xlabel('Fecha')
+plt.ylabel('Número de casos')
+plt.title('Comparación entre datos reales y predicciones')
+plt.legend()
+plt.show()
+
+
+# FORECASTING CON REDES LSTM-PARTE 3: MODELO UNIVARIADO-MULTISTEP
+
+
+# Cargar los datos
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+
+# Fit and transform the cases column
+datos_fechas_casos['casos_estandarizados'] = scaler.fit_transform(datos_fechas_casos[['casos_pesados_filtrados']])
+
+datos = datos_fechas_casos['casos_pesados_filtrados']
+
+train = datos.loc['2014-09-01':'2017-09-01']
+val = datos.loc['2017-09-02':'2018-09-02']
+test = datos.loc['2018-09-03':'2019-04-14']
+
+# Probando cosas nuevas
+train = datos.loc[:'2017-06-01']
+val = datos.loc['2017-06-02':'2018-09-02']
+test = datos.loc['2018-09-03':'2019-04-14']
+
+
+print(f'Tamaño set de entrenamiento: {train.shape}')
+print(f'Tamaño set de validación: {val.shape}')
+print(f'Tamaño set de prueba: {test.shape}')
+
+
+
+def crear_dataset_supervisado(array, input_length, output_length):
+
+    # Inicialización
+    X, Y = [], []    # Listados que contendrán los datos de entrada y salida del modelo
+    shape = array.shape
+    if len(shape)==1: # Si tenemos sólo una serie (univariado)
+        fils, cols = array.shape[0], 1
+        array = array.reshape(fils,cols)
+    else: # Multivariado
+        fils, cols = array.shape
+
+    # Generar los arreglos
+    for i in range(0,fils-input_length-output_length,7):
+        X.append(array[i:i+INPUT_LENGTH,0:cols])
+        Y.append(array[i+input_length:i+input_length+output_length,-1].reshape(output_length,1))
+    
+    # Convertir listas a arreglos de NumPy
+    X = np.array(X)
+    Y = np.array(Y)
+    
+    return X, Y
+
+INPUT_LENGTH = 60 # 60 días
+OUTPUT_LENGTH = 14 # 30 días (un mes a futuro)
+
+# Datasets supervisados para entrenamiento (x_tr, y_tr), validación
+# (x_vl, y_vl) y prueba (x_ts, y_ts)
+x_tr, y_tr = crear_dataset_supervisado(train.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_vl, y_vl = crear_dataset_supervisado(val.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_ts, y_ts = crear_dataset_supervisado(test.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print('Tamaños entrada (BATCHES x INPUT_LENGTH x FEATURES) y de salida (BATCHES x OUTPUT_LENGTH x FEATURES)')
+print(f'Set de entrenamiento - x_tr: {x_tr.shape}, y_tr: {y_tr.shape}')
+print(f'Set de validación - x_vl: {x_vl.shape}, y_vl: {y_vl.shape}')
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import RMSprop
+import tensorflow as tf
+from tensorflow.keras.layers import Dropout
+from keras.regularizers import l2
+
+tf.random.set_seed(123)
+tf.config.experimental.enable_op_determinism()
+
+# El modelo
+N_UNITS_1 = 300
+N_UNITS_2 = 300
+INPUT_SHAPE = (x_tr_s.shape[1], x_tr_s.shape[2]) 
+
+modelo = Sequential()
+modelo.add(LSTM(N_UNITS_1, input_shape=INPUT_SHAPE, return_sequences = True))
+modelo.add(Dropout(0.0))
+modelo.add(LSTM(N_UNITS_2))
+modelo.add(Dense(OUTPUT_LENGTH, activation='linear'))
+
+def root_mean_squared_error(y_true, y_pred):
+    rmse = tf.math.sqrt(tf.math.reduce_mean(tf.square(y_pred-y_true)))
+    return rmse
+
+optimizador = RMSprop(learning_rate=5e-5)
+modelo.compile(
+    optimizer = optimizador,
+    loss = root_mean_squared_error,
+)
+
+EPOCHS = 300
+BATCH_SIZE = 32
+historia = modelo.fit(
+    x = x_tr_s,
+    y = y_tr_s,
+    batch_size = BATCH_SIZE,
+    epochs = EPOCHS,
+    validation_data = (x_vl_s, y_vl_s),
+    verbose=2,
+)
+
+# Graficar curvas de entrenamiento y validación
+plt.plot(historia.history['loss'], label = 'RMSE train')
+plt.plot(historia.history['val_loss'], label = 'RMSE val')
+plt.xlabel('Iteración')
+plt.ylabel('RMSE')
+plt.legend();
+
+# Cálculo de rmses para train, val y test
+rmse_tr = modelo.evaluate(x=x_tr_s, y=y_tr_s, verbose=0)
+rmse_vl = modelo.evaluate(x=x_vl_s, y=y_vl_s, verbose=0)
+rmse_ts = modelo.evaluate(x=x_ts_s, y=y_ts_s, verbose=0)
+
+print('Comparativo desempeños:')
+print(f'  RMSE train:\t {rmse_tr:.3f}')
+print(f'  RMSE val:\t {rmse_vl:.3f}')
+print(f'  RMSE test:\t {rmse_ts:.3f}')
+
+# Hyperparameters Tunning
+
+dropoutIndex = [0.0, 0.1, 0.2, 0.4]
+N_UNITS_1 = [100, 300, 500, 1000]
+N_UNITS_2 = [100, 300, 500, 1000]
+OUTPUT_LENGTH = 14
+lossFunction = root_mean_squared_error
+#optimizador = RMSprop(learning_rate=5e-5)
+from tensorflow.keras.optimizers import legacy
+optimizador = legacy.RMSprop(learning_rate=5e-5)
+Epochs = [50, 300, 500]
+batchSize = [32, 72, 128]
+Verbose = 2
+
+plt.rcParams['figure.figsize'] = 25, 10
+plt.rcParams.update({'font.size': 20, 'font.family': 'Arial'})
+
+class tunningTheBatchSize():
+    
+    def tunningWithBatchSize32():
+        
+        modelWithBatchSize32 = Sequential()
+        modelWithBatchSize32.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize32.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize32.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize32.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize32.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize32.trainable_variables)
+
+        historyBatchSize32 = modelWithBatchSize32.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+
+        return historyBatchSize32
+        
+    def tunningWithBatchSize72():
+        
+        modelWithBatchSize72 = Sequential()
+        modelWithBatchSize72.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize72.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize72.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize72.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize72.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize72.trainable_variables)
+
+        historyBatchSize72 = modelWithBatchSize72.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[1], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+
+        return historyBatchSize72
+
+    def tunningWithBatchSize128():
+        
+        modelWithBatchSize128 = Sequential()
+        modelWithBatchSize128.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize128.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize128.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize128.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize128.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize128.trainable_variables)
+        
+        historyBatchSize128 = modelWithBatchSize128.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[2], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+
+        return historyBatchSize128
+    
+class tunningTheEpochs():
+        
+    def tunningWith50Epochs():
+        
+        modelWith50Epochs = Sequential()
+        modelWith50Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith50Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith50Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith50Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith50Epochs.compile(loss = lossFunction, optimizer = optimizador)
+
+        history50Epochs = modelWith50Epochs.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[0], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+        
+        return history50Epochs
+              
+    def tunningWith300Epochs():
+        
+        modelWith300Epochs = Sequential()
+        modelWith300Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith300Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith300Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith300Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith300Epochs.compile(loss = lossFunction, optimizer = optimizador)
+
+        history300Epochs = modelWith300Epochs.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+       
+        return history300Epochs
+
+    def tunningWith500Epochs():
+        
+        modelWith500Epochs = Sequential()
+        modelWith500Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith500Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith500Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith500Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith500Epochs.compile(loss = lossFunction, optimizer = optimizador)
+        
+       # callbacks = [EarlyStopping(monitor = 'val_loss', patience = 10)]
+                     
+        history500Epochs = modelWith500Epochs.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+       
+        return history500Epochs
+        
+class tunningTheLSTMNeurons():
+    
+    def tunningWith100Neurons():
+        
+        modelWith100Neurons = Sequential()
+        modelWith100Neurons.add(LSTM(N_UNITS_1[0], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith100Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith100Neurons.add(LSTM(N_UNITS_2[0]))
+        modelWith100Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith100Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history100Neurons = modelWith100Neurons.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history100Neurons
+    
+    def tunningWith300Neurons():
+        
+        modelWith300Neurons = Sequential()
+        modelWith300Neurons.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith300Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith300Neurons.add(LSTM(N_UNITS_2[1]))
+        modelWith300Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith300Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history300Neurons = modelWith300Neurons.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history300Neurons
+    
+    def tunningWith500Neurons():
+        
+        modelWith500Neurons = Sequential()
+        modelWith500Neurons.add(LSTM(N_UNITS_1[2], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith500Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith500Neurons.add(LSTM(N_UNITS_2[2]))
+        modelWith500Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith500Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history500Neurons = modelWith500Neurons.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history500Neurons
+    
+    def tunningWith1000Neurons():
+        
+        modelWith1000Neurons = Sequential()
+        modelWith1000Neurons.add(LSTM(N_UNITS_1[3], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith1000Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith1000Neurons.add(LSTM(N_UNITS_2[3]))
+        modelWith1000Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith1000Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        #callbacks = [EarlyStopping(monitor = 'val_loss', patience = 10)]
+                     
+        history1000Neurons = modelWith1000Neurons.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history1000Neurons
+
+class tunningTheDropOut():
+    
+    def tunningWith0DropOut():
+        
+        modelWith0DropOut = Sequential()
+        modelWith0DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith0DropOut.add(Dropout(dropoutIndex[0]))
+        modelWith0DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith0DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith0DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history0DropOut = modelWith0DropOut.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history0DropOut
+    
+    def tunningWith01DropOut():
+        
+        modelWith01DropOut = Sequential()
+        modelWith01DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith01DropOut.add(Dropout(dropoutIndex[1]))
+        modelWith01DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith01DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith01DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history01DropOut = modelWith01DropOut.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history01DropOut
+    
+    def tunningWith02DropOut():
+        
+        modelWith02DropOut = Sequential()
+        modelWith02DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith02DropOut.add(Dropout(dropoutIndex[2]))
+        modelWith02DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith02DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith02DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history02DropOut = modelWith02DropOut.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history02DropOut
+    
+    def tunningWith04DropOut():
+        
+        modelWith04DropOut = Sequential()
+        modelWith04DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith04DropOut.add(Dropout(dropoutIndex[3]))
+        modelWith04DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith04DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith04DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history04DropOut = modelWith04DropOut.fit(x = x_tr_s, y = y_tr_s, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl_s, y_vl_s), verbose = Verbose)
+      
+        return history04DropOut
+
+
+# Plots 
+
+# Batch Size
+
+historyBatchSize32 = tunningTheBatchSize.tunningWithBatchSize32()
+historyBatchSize72 = tunningTheBatchSize.tunningWithBatchSize72()
+historyBatchSize128 = tunningTheBatchSize.tunningWithBatchSize128()
+
+plt.plot(historyBatchSize32.history['loss'], color = 'b')
+plt.plot(historyBatchSize72.history['loss'], color = 'r')
+plt.plot(historyBatchSize128.history['loss'], color = 'k')
+plt.plot(historyBatchSize32.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(historyBatchSize72.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(historyBatchSize128.history['val_loss'], color = 'k', linestyle = '--')
+
+plt.title('Tunning the Batch Size')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['Batch Size 32 - Train', 'Batch Size 72 - Train', 'Batch Size 128 - Train', 'Batch Size 32 - Val', 'Batch Size 72 - Val', 'Batch Size 128 - Val'], loc='upper right')
+plt.show()
+
+# Epochs
+
+history50Epochs = tunningTheEpochs.tunningWith50Epochs()
+history300Epochs = tunningTheEpochs.tunningWith300Epochs()
+history500Epochs = tunningTheEpochs.tunningWith500Epochs()
+
+plt.plot(history50Epochs.history['loss'], color = 'r')
+plt.plot(history300Epochs.history['loss'], color = 'k')
+plt.plot(history500Epochs.history['loss'], color = 'g')
+plt.plot(history50Epochs.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history300Epochs.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history500Epochs.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the Epochs')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['50 Epochs - Train', '300 Epochs - Train', '500 Epochs - Train',  '50 Epochs - Val', '300 Epochs - Val', '500 Epochs - Val'], loc='upper right')
+plt.show()
+
+# Number of Neurons
+
+history100Neurons = tunningTheLSTMNeurons.tunningWith100Neurons()
+history300Neurons = tunningTheLSTMNeurons.tunningWith300Neurons()
+history500Neurons = tunningTheLSTMNeurons.tunningWith500Neurons()
+history1000Neurons = tunningTheLSTMNeurons.tunningWith1000Neurons()
+
+plt.plot(history100Neurons.history['loss'], color = 'r')
+plt.plot(history300Neurons.history['loss'], color = 'b')
+plt.plot(history500Neurons.history['loss'], color = 'k')
+plt.plot(history1000Neurons.history['loss'], color = 'g')
+plt.plot(history100Neurons.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history300Neurons.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(history500Neurons.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history1000Neurons.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the Number of Neurons')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['100 Neurons - Train', '300 Neurons - Train', '500 Neuronss - Train', '1000 Neurons - Train', '100 Neurons - Val', '300 Neurons - Val', '500 Neuronss - Val', '1000 Neurons - Val'], loc='upper right')
+plt.show()
+
+# Number of DropOut
+
+history0DropOut = tunningTheDropOut.tunningWith0DropOut()
+history01DropOut = tunningTheDropOut.tunningWith01DropOut()
+history02DropOut = tunningTheDropOut.tunningWith02DropOut()
+history04DropOut = tunningTheDropOut.tunningWith04DropOut()
+
+plt.plot(history0DropOut.history['loss'], color = 'r')
+plt.plot(history01DropOut.history['loss'], color = 'b')
+plt.plot(history02DropOut.history['loss'], color = 'k')
+plt.plot(history04DropOut.history['loss'], color = 'g')
+plt.plot(history0DropOut.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history01DropOut.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(history02DropOut.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history04DropOut.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the DropOut')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['0.0 DropOut - Train', '0.1 DropOut - Train', '0.2 DropOut - Train', '0.4 DropOut - Train', '0.0 DropOut - Val', '0.1 DropOut - Val', '0.2 DropOut - Val', '0.4 DropOut - Val'], loc='upper right')
+plt.show()
+
+# Predicciones con el modelo entrenado
+
+# 1. Generar las predicciones sobre el set de prueba
+y_ts_pred_s = modelo.predict(x_ts_s, verbose = 0)
+
+# 2. Realizar la transformación inversa de las predicciones para llevar sus valores a la escala original
+y_ts_pred = scaler.inverse_transform(y_ts_pred_s)
+
+# 3. Calcular RMSE para cada instante de tiempo predicho
+diff_cuad = np.square(y_ts.squeeze()-y_ts_pred) #longitud de prueba (276) x 30 (días que predice), para cada día una predicción, tenemos 30 columnas
+# primera columna --> primer día predicho para todos los datos de prueba
+proms = np.mean(diff_cuad, axis = 0) # 1x30
+rmse = np.sqrt(proms) # 1x30
+
+t = np.linspace (1,30,30)
+
+fig, ax = plt.subplots()
+ax.scatter(t,rmse)
+ax.set_xlabel('Día predicho')
+ax.set_ylabel('Error RMSE')
+plt.xticks(ticks = t, labels = t)
+plt.grid()
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+# Predicciones con el modelo entrenado
+y_ts_pred_dim, _= predecir(x_ts_s, modelo, scaler)
+_ ,y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+N = len(y_ts_pred) #Número de predicciones
+ndato = np.linspace(1,N,N)
+errores = y_ts.flatten()-y_ts_pred
+errores_absolutos = np.abs(y_ts.flatten()-y_ts_pred)
+plt.plot(errores_absolutos)
+
+import seaborn as sns
+from scipy import stats
+
+def calculate_MAPE(y_ts, y_ts_pred):
+    # Calcular el error absoluto
+    errors = np.abs((y_ts.flatten() - y_ts_pred) / y_ts.flatten())
+    
+    # Calcular el MAPE
+    mape = np.mean(errors) * 100
+    
+    return mape
+
+def MAPE(y_ts, y_ts_pred):
+    y_ts, y_ts_pred = np.array(y_ts.flatten()), np.array(y_ts_pred)
+    mape = np.mean(np.abs((y_ts - y_ts_pred) / y_ts))
+    return mape
+
+from sklearn.metrics import mean_absolute_percentage_error
+
+def cálculo_intervalos_confianza(y_ts_pred, y_ts):
+    # Lista para almacenar los errores de predicción
+    errores_prediccion = []
+
+    # Calcular el error de predicción y agregarlo a la lista
+    for i in range(len(y_ts_pred)):
+        error_prediccion = y_ts_pred[i] - y_ts.flatten()[i]
+        errores_prediccion.append(error_prediccion)
+
+    # Calcular la desviación estándar de los errores de predicción
+    desviacion_estandar_error = np.std(errores_prediccion)
+
+    # Límites superior e inferior del intervalo de confianza del 95%
+    intervalos_confianza = []
+    for i in range(len(y_ts_pred)):
+        limite_superior = y_ts_pred[i] + 1.96 * desviacion_estandar_error
+        limite_inferior = y_ts_pred[i] - 1.96 * desviacion_estandar_error
+        intervalos_confianza.append((limite_inferior, limite_superior))
+    return intervalos_confianza
+
+intervalos_confianza_1 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+from datetime import datetime, timedelta
+# Definir la fecha de inicio y fin
+fecha_inicio = datetime.strptime('2018-09-03', '%Y-%m-%d') + timedelta(days=40)
+fecha_fin = datetime.strptime('2019-04-14', '%Y-%m-%d') - timedelta(days=2)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, periods=182)
+
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+
+# Plotear los límites superior e inferior del intervalo de confianza
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_1]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_1]
+#plt.plot(rango_fechas, intervalos_inferiores, label='Lower Bound', linestyle='--', color='green')
+#plt.plot(rango_fechas, intervalos_superiores, label='Upper Bound', linestyle='--', color='red')
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+
+# Añadir intervalos de confianza del 95%
+#for i in range(len(rango_fechas)):
+#    plt.fill_between([rango_fechas[i]], intervalos_confianza[i][0], intervalos_confianza[i][1], color='#1f77b4', alpha=0.2)
+
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Para la temporada 2019-2020
+test_2 = datos.loc['2019-09-03':'2020-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+# Predicciones con el modelo entrenado
+y_ts_pred_dim, _= predecir(x_ts_s, modelo, scaler)
+_ ,y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test_2.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+# Encontrar el índice del valor más cercano a cero en y_ts
+indice_cercano_a_cero = np.argmin(np.abs(y_ts.flatten()))
+
+# Obtener el valor más cercano a cero en y_ts
+valor_cercano_a_cero = y_ts.flatten()[indice_cercano_a_cero]
+
+print("Índice del valor más cercano a cero:", indice_cercano_a_cero)
+print("Valor más cercano a cero:", valor_cercano_a_cero)
+
+intervalos_confianza_2 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2019-09-03', '%Y-%m-%d') + timedelta(days=40)
+fecha_fin_2 = datetime.strptime('2020-04-14', '%Y-%m-%d') - timedelta(days=3)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=182)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_2]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_2]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+
+
+# Para la temporada 2023-2024
+
+test_2 = datos.loc['2023-09-03':'2024-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+# Predicciones con el modelo entrenado
+y_ts_pred_dim, _= predecir(x_ts_s, modelo, scaler)
+_ ,y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test_2.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+intervalos_confianza_3 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2023-09-03', '%Y-%m-%d') + timedelta(days=40)
+fecha_fin_2 = datetime.strptime('2024-04-14', '%Y-%m-%d') - timedelta(days=3)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=182)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_3]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_3]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Ahora vamos a hacer lo mismo pero estandarizando los datos antes de entrenar y sin usar minmax()
+# Cargar los datos
+
+# Creamos una función de tal forma que cuando las predicciones se realicen más de una vez en el mismo día
+
+
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+
+# Fit and transform the cases column
+datos_fechas_casos['casos_estandarizados'] = scaler.fit_transform(datos_fechas_casos[['casos_pesados_filtrados']])
+
+datos = datos_fechas_casos['casos_estandarizados']
+
+
+
+train = datos.loc['2014-09-01':'2017-09-01']
+val = datos.loc['2017-09-02':'2018-09-02']
+test = datos.loc['2018-09-03':'2019-04-14']
+
+
+print(f'Tamaño set de entrenamiento: {train.shape}')
+print(f'Tamaño set de validación: {val.shape}')
+print(f'Tamaño set de prueba: {test.shape}')
+
+
+INPUT_LENGTH = 60 # 60 días
+OUTPUT_LENGTH = 14 # 30 días (un mes a futuro)
+
+def crear_dataset_supervisado(array, input_length, output_length):
+
+    # Inicialización
+    X, Y = [], []    # Listados que contendrán los datos de entrada y salida del modelo
+    shape = array.shape
+    if len(shape)==1: # Si tenemos sólo una serie (univariado)
+        fils, cols = array.shape[0], 1
+        array = array.reshape(fils,cols)
+    else: # Multivariado
+        fils, cols = array.shape
+
+    # Generar los arreglos
+    for i in range(0,fils-input_length-output_length,7):
+        X.append(array[i:i+INPUT_LENGTH,0:cols])
+        Y.append(array[i+input_length:i+input_length+output_length,-1].reshape(output_length,1))
+    
+    # Convertir listas a arreglos de NumPy
+    X = np.array(X)
+    Y = np.array(Y)
+    
+    return X, Y
+
+
+# Datasets supervisados para entrenamiento (x_tr, y_tr), validación
+# (x_vl, y_vl) y prueba (x_ts, y_ts)
+x_tr, y_tr = crear_dataset_supervisado(train.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_vl, y_vl = crear_dataset_supervisado(val.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_ts, y_ts = crear_dataset_supervisado(test.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print('Tamaños entrada (BATCHES x INPUT_LENGTH x FEATURES) y de salida (BATCHES x OUTPUT_LENGTH x FEATURES)')
+print(f'Set de entrenamiento - x_tr: {x_tr.shape}, y_tr: {y_tr.shape}')
+print(f'Set de validación - x_vl: {x_vl.shape}, y_vl: {y_vl.shape}')
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import RMSprop
+import tensorflow as tf
+from tensorflow.keras.layers import Dropout
+from keras.regularizers import l2
+
+tf.random.set_seed(123)
+tf.config.experimental.enable_op_determinism()
+
+# El modelo
+N_UNITS_1 = 300
+N_UNITS_2 = 300
+INPUT_SHAPE = (x_tr.shape[1], x_tr.shape[2]) 
+
+modelo = Sequential()
+modelo.add(LSTM(N_UNITS_1, input_shape=INPUT_SHAPE, return_sequences = True))
+modelo.add(Dropout(0.0))
+modelo.add(LSTM(N_UNITS_2))
+modelo.add(Dense(OUTPUT_LENGTH, activation='linear'))
+
+def root_mean_squared_error(y_true, y_pred):
+    rmse = tf.math.sqrt(tf.math.reduce_mean(tf.square(y_pred-y_true)))
+    return rmse
+
+optimizador = RMSprop(learning_rate=5e-5)
+modelo.compile(
+    optimizer = optimizador,
+    loss = root_mean_squared_error,
+)
+
+EPOCHS = 300
+BATCH_SIZE = 32
+historia = modelo.fit(
+    x = x_tr,
+    y = y_tr,
+    batch_size = BATCH_SIZE,
+    epochs = EPOCHS,
+    validation_data = (x_vl, y_vl),
+    verbose=2,
+)
+
+# Graficar curvas de entrenamiento y validación
+plt.plot(historia.history['loss'], label = 'RMSE train')
+plt.plot(historia.history['val_loss'], label = 'RMSE val')
+plt.xlabel('Iteración')
+plt.ylabel('RMSE')
+plt.legend();
+
+# Cálculo de rmses para train, val y test
+rmse_tr = modelo.evaluate(x=x_tr, y=y_tr, verbose=0)
+rmse_vl = modelo.evaluate(x=x_vl, y=y_vl, verbose=0)
+rmse_ts = modelo.evaluate(x=x_ts, y=y_ts, verbose=0)
+
+print('Comparativo desempeños:')
+print(f'  RMSE train:\t {rmse_tr:.3f}')
+print(f'  RMSE val:\t {rmse_vl:.3f}')
+print(f'  RMSE test:\t {rmse_ts:.3f}')
+
+# Hyperparameters Tunning
+
+dropoutIndex = [0.0, 0.1, 0.2, 0.4]
+N_UNITS_1 = [100, 300, 500, 1000]
+N_UNITS_2 = [100, 300, 500, 1000]
+OUTPUT_LENGTH = 14
+lossFunction = root_mean_squared_error
+#optimizador = RMSprop(learning_rate=5e-5)
+from tensorflow.keras.optimizers import legacy
+optimizador = legacy.RMSprop(learning_rate=5e-5)
+Epochs = [50, 300, 500]
+batchSize = [32, 72, 128]
+Verbose = 2
+
+plt.rcParams['figure.figsize'] = 25, 10
+plt.rcParams.update({'font.size': 20, 'font.family': 'Arial'})
+
+class tunningTheBatchSize():
+    
+    def tunningWithBatchSize32():
+        
+        modelWithBatchSize32 = Sequential()
+        modelWithBatchSize32.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize32.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize32.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize32.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize32.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize32.trainable_variables)
+
+        historyBatchSize32 = modelWithBatchSize32.fit(x = x_tr, y = y_tr, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+
+        return historyBatchSize32
+        
+    def tunningWithBatchSize72():
+        
+        modelWithBatchSize72 = Sequential()
+        modelWithBatchSize72.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize72.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize72.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize72.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize72.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize72.trainable_variables)
+
+        historyBatchSize72 = modelWithBatchSize72.fit(x = x_tr, y = y_tr, epochs = Epochs[1], batch_size = batchSize[1], validation_data = (x_vl, y_vl), verbose = Verbose)
+
+        return historyBatchSize72
+
+    def tunningWithBatchSize128():
+        
+        modelWithBatchSize128 = Sequential()
+        modelWithBatchSize128.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWithBatchSize128.add(Dropout(dropoutIndex[0]))
+        modelWithBatchSize128.add(LSTM(N_UNITS_2[1]))
+        modelWithBatchSize128.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWithBatchSize128.compile(loss = lossFunction, optimizer = optimizador)
+        # Construye el optimizador con las variables entrenables del modelo
+        #optimizador.build(modelWithBatchSize128.trainable_variables)
+        
+        historyBatchSize128 = modelWithBatchSize128.fit(x = x_tr, y = y_tr, epochs = Epochs[1], batch_size = batchSize[2], validation_data = (x_vl, y_vl), verbose = Verbose)
+
+        return historyBatchSize128
+    
+class tunningTheEpochs():
+        
+    def tunningWith50Epochs():
+        
+        modelWith50Epochs = Sequential()
+        modelWith50Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith50Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith50Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith50Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith50Epochs.compile(loss = lossFunction, optimizer = optimizador)
+
+        history50Epochs = modelWith50Epochs.fit(x = x_tr, y = y_tr, epochs = Epochs[0], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+        
+        return history50Epochs
+              
+    def tunningWith300Epochs():
+        
+        modelWith300Epochs = Sequential()
+        modelWith300Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith300Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith300Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith300Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith300Epochs.compile(loss = lossFunction, optimizer = optimizador)
+
+        history300Epochs = modelWith300Epochs.fit(x = x_tr, y = y_tr, epochs = Epochs[1], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+       
+        return history300Epochs
+
+    def tunningWith500Epochs():
+        
+        modelWith500Epochs = Sequential()
+        modelWith500Epochs.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith500Epochs.add(Dropout(dropoutIndex[0]))
+        modelWith500Epochs.add(LSTM(N_UNITS_2[1]))
+        modelWith500Epochs.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith500Epochs.compile(loss = lossFunction, optimizer = optimizador)
+        
+       # callbacks = [EarlyStopping(monitor = 'val_loss', patience = 10)]
+                     
+        history500Epochs = modelWith500Epochs.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+       
+        return history500Epochs
+        
+class tunningTheLSTMNeurons():
+    
+    def tunningWith100Neurons():
+        
+        modelWith100Neurons = Sequential()
+        modelWith100Neurons.add(LSTM(N_UNITS_1[0], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith100Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith100Neurons.add(LSTM(N_UNITS_2[0]))
+        modelWith100Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith100Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history100Neurons = modelWith100Neurons.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history100Neurons
+    
+    def tunningWith300Neurons():
+        
+        modelWith300Neurons = Sequential()
+        modelWith300Neurons.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith300Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith300Neurons.add(LSTM(N_UNITS_2[1]))
+        modelWith300Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith300Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history300Neurons = modelWith300Neurons.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history300Neurons
+    
+    def tunningWith500Neurons():
+        
+        modelWith500Neurons = Sequential()
+        modelWith500Neurons.add(LSTM(N_UNITS_1[2], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith500Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith500Neurons.add(LSTM(N_UNITS_2[2]))
+        modelWith500Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith500Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        history500Neurons = modelWith500Neurons.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history500Neurons
+    
+    def tunningWith1000Neurons():
+        
+        modelWith1000Neurons = Sequential()
+        modelWith1000Neurons.add(LSTM(N_UNITS_1[3], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith1000Neurons.add(Dropout(dropoutIndex[0]))
+        modelWith1000Neurons.add(LSTM(N_UNITS_2[3]))
+        modelWith1000Neurons.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith1000Neurons.compile(loss = lossFunction, optimizer = optimizador)
+
+        #callbacks = [EarlyStopping(monitor = 'val_loss', patience = 10)]
+                     
+        history1000Neurons = modelWith1000Neurons.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history1000Neurons
+
+class tunningTheDropOut():
+    
+    def tunningWith0DropOut():
+        
+        modelWith0DropOut = Sequential()
+        modelWith0DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith0DropOut.add(Dropout(dropoutIndex[0]))
+        modelWith0DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith0DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith0DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history0DropOut = modelWith0DropOut.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history0DropOut
+    
+    def tunningWith01DropOut():
+        
+        modelWith01DropOut = Sequential()
+        modelWith01DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith01DropOut.add(Dropout(dropoutIndex[1]))
+        modelWith01DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith01DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith01DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history01DropOut = modelWith01DropOut.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history01DropOut
+    
+    def tunningWith02DropOut():
+        
+        modelWith02DropOut = Sequential()
+        modelWith02DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith02DropOut.add(Dropout(dropoutIndex[2]))
+        modelWith02DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith02DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith02DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history02DropOut = modelWith02DropOut.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history02DropOut
+    
+    def tunningWith04DropOut():
+        
+        modelWith04DropOut = Sequential()
+        modelWith04DropOut.add(LSTM(N_UNITS_1[1], input_shape = INPUT_SHAPE, return_sequences = True))
+        modelWith04DropOut.add(Dropout(dropoutIndex[3]))
+        modelWith04DropOut.add(LSTM(N_UNITS_2[1]))
+        modelWith04DropOut.add(Dense(OUTPUT_LENGTH, activation='linear'))
+        modelWith04DropOut.compile(loss = lossFunction, optimizer = optimizador)
+
+        history04DropOut = modelWith04DropOut.fit(x = x_tr, y = y_tr, epochs = Epochs[2], batch_size = batchSize[0], validation_data = (x_vl, y_vl), verbose = Verbose)
+      
+        return history04DropOut
+
+
+# Plots 
+
+# Batch Size
+
+historyBatchSize32 = tunningTheBatchSize.tunningWithBatchSize32()
+historyBatchSize72 = tunningTheBatchSize.tunningWithBatchSize72()
+historyBatchSize128 = tunningTheBatchSize.tunningWithBatchSize128()
+
+plt.plot(historyBatchSize32.history['loss'], color = 'b')
+plt.plot(historyBatchSize72.history['loss'], color = 'r')
+plt.plot(historyBatchSize128.history['loss'], color = 'k')
+plt.plot(historyBatchSize32.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(historyBatchSize72.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(historyBatchSize128.history['val_loss'], color = 'k', linestyle = '--')
+
+plt.title('Tunning the Batch Size')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['Batch Size 32 - Train', 'Batch Size 72 - Train', 'Batch Size 128 - Train', 'Batch Size 32 - Val', 'Batch Size 72 - Val', 'Batch Size 128 - Val'], loc='upper right')
+plt.show()
+
+# Epochs
+
+history50Epochs = tunningTheEpochs.tunningWith50Epochs()
+history300Epochs = tunningTheEpochs.tunningWith300Epochs()
+history500Epochs = tunningTheEpochs.tunningWith500Epochs()
+
+plt.plot(history50Epochs.history['loss'], color = 'r')
+plt.plot(history300Epochs.history['loss'], color = 'k')
+plt.plot(history500Epochs.history['loss'], color = 'g')
+plt.plot(history50Epochs.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history300Epochs.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history500Epochs.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the Epochs')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['50 Epochs - Train', '300 Epochs - Train', '500 Epochs - Train',  '50 Epochs - Val', '300 Epochs - Val', '500 Epochs - Val'], loc='upper right')
+plt.show()
+
+# Number of Neurons
+
+history100Neurons = tunningTheLSTMNeurons.tunningWith100Neurons()
+history300Neurons = tunningTheLSTMNeurons.tunningWith300Neurons()
+history500Neurons = tunningTheLSTMNeurons.tunningWith500Neurons()
+history1000Neurons = tunningTheLSTMNeurons.tunningWith1000Neurons()
+
+plt.plot(history100Neurons.history['loss'], color = 'r')
+plt.plot(history300Neurons.history['loss'], color = 'b')
+plt.plot(history500Neurons.history['loss'], color = 'k')
+plt.plot(history1000Neurons.history['loss'], color = 'g')
+plt.plot(history100Neurons.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history300Neurons.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(history500Neurons.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history1000Neurons.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the Number of Neurons')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['100 Neurons - Train', '300 Neurons - Train', '500 Neuronss - Train', '1000 Neurons - Train', '100 Neurons - Val', '300 Neurons - Val', '500 Neuronss - Val', '1000 Neurons - Val'], loc='upper right')
+plt.show()
+
+# Number of DropOut
+
+history0DropOut = tunningTheDropOut.tunningWith0DropOut()
+history01DropOut = tunningTheDropOut.tunningWith01DropOut()
+history02DropOut = tunningTheDropOut.tunningWith02DropOut()
+history04DropOut = tunningTheDropOut.tunningWith04DropOut()
+
+plt.plot(history0DropOut.history['loss'], color = 'r')
+plt.plot(history01DropOut.history['loss'], color = 'b')
+plt.plot(history02DropOut.history['loss'], color = 'k')
+plt.plot(history04DropOut.history['loss'], color = 'g')
+plt.plot(history0DropOut.history['val_loss'], color = 'r', linestyle = '--')
+plt.plot(history01DropOut.history['val_loss'], color = 'b', linestyle = '--')
+plt.plot(history02DropOut.history['val_loss'], color = 'k', linestyle = '--')
+plt.plot(history04DropOut.history['val_loss'], color = 'g', linestyle = '--')
+
+plt.title('Tunning the DropOut')
+plt.ylabel('loss')
+plt.xlabel('epoch')
+plt.legend(['0.0 DropOut - Train', '0.1 DropOut - Train', '0.2 DropOut - Train', '0.4 DropOut - Train', '0.0 DropOut - Val', '0.1 DropOut - Val', '0.2 DropOut - Val', '0.4 DropOut - Val'], loc='upper right')
+plt.show()
+
+# Predicciones con el modelo entrenado
+y_ts_pred_dim, _= predecir(x_ts, modelo, scaler)
+_ ,y_ts_pred = predecir(x_ts, modelo, scaler)
+y_ts_inverse = scaler.inverse_transform(y_ts.reshape(-1,1))
+y_ts = y_ts_inverse.reshape(y_ts.shape)
+
+# Creamos una función de tal forma que cuando las predicciones se realicen más de una vez en el mismo día
+
+def graficar_predicciones(x, y_true, y_pred, fechas):
+    """
+    Grafica las predicciones para todos los batches en una sola figura.
+    
+    Entradas:
+        x: Datos de entrada (dimensiones: batches x input_length x features).
+        y_true: Valores reales (dimensiones: batches x output_length x 1).
+        y_pred: Predicciones del modelo (dimensiones: batches x output_length x 1).
+    """
+    batches = x.shape[0]
+    output_length = y_true.shape[1]
+    
+    plt.figure(figsize=(12, 8))
+    for i in range(batches):
+        plt.plot(fechas[i], y_true[i], label=f'Batch {i+1} - Real', marker='o', color = 'grey', alpha = 0.2)
+        plt.plot(fechas[i], y_pred[i], label=f'Batch {i+1} - Predicción', marker='x')
+    
+    plt.xlabel('Dates', fontsize=20, fontname='Arial')
+    plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+    plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+   # plt.legend(fontsize = 18)
+    plt.xticks(fontsize=14)
+    plt.yticks(fontsize=14)
+    plt.show()
+
+
+def graficar_predicciones_int_conf(x, y_true, y_pred, fechas):
+    """
+    Grafica las predicciones para todos los batches en una sola figura.
+
+    Entradas:
+        x: Datos de entrada (dimensiones: batches x input_length x features).
+        y_true: Valores reales (dimensiones: batches x output_length x 1).
+        y_pred: Predicciones del modelo (dimensiones: batches x output_length x 1).
+        fechas: Fechas correspondientes a las predicciones (lista de arrays de fechas por cada batch).
+    """
+    batches = x.shape[0]
+    output_length = y_true.shape[1]
+
+    plt.figure(figsize=(12, 8))
+
+    # Inicializar una lista para almacenar todas las predicciones y valores reales
+    all_predictions = []
+    all_true_values = []
+
+    # Recorrer todos los batches y concatenar las predicciones y valores reales
+    for i in range(batches):
+        all_predictions.extend(y_pred[i].flatten())
+        all_true_values.extend(y_true[i].flatten())
+
+    all_predictions = np.array(all_predictions)
+    all_true_values = np.array(all_true_values)
+    
+    #print(all_predictions)
+    #print(all_predictions.shape)
+    # Calcular errores de predicción
+    errores_prediccion = all_predictions - all_true_values
+
+    # Calcular la desviación estándar de los errores de predicción
+    desviacion_estandar_error = np.std(errores_prediccion)
+
+    # Graficar predicciones y datos reales
+    for i in range(batches):
+        plt.plot(fechas[i], y_true[i], marker='o', color='grey', alpha=0.3)
+        plt.plot(fechas[i], y_pred[i], marker='x')
+
+        # Calcular intervalo de confianza (±1 desviación estándar de los errores de predicción)
+        confidence_interval = 1.96 * desviacion_estandar_error  # 95% confidence interval
+        upper_bound = y_pred[i] + confidence_interval
+        lower_bound = y_pred[i] - confidence_interval
+     
+        # Graficar líneas verticales para representar el intervalo de confianza
+        for j in range(len(fechas[i])):
+            plt.plot([fechas[i][j], fechas[i][j]], [lower_bound[j], upper_bound[j]], color='blue', alpha=0.1)
+    
+
+        # Graficar intervalo de confianza
+        #plt.fill_between(fechas[i].flatten(), lower_bound.flatten(), upper_bound.flatten(), color='blue', alpha=0.1)
+        
+    plt.xlabel('Dates', fontsize=20, fontname='Arial')
+    plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+    plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+    plt.xticks(fontsize=14)
+    plt.yticks(fontsize=14)
+    plt.legend(['Real Cases', 'Predicted Cases'], fontsize=16, loc='upper right')
+    plt.grid(True)
+    plt.ylim(-300, 3100) 
+    plt.show()
+    
+    return all_predictions, all_true_values
+    
+from collections import defaultdict
+from matplotlib.lines import Line2D
+    
+def media_predicciones (x, y_true, y_pred, fechas):
+    """
+    Grafica la media de las predicciones respecto los casos reales
+    (sin tener en cuenta le media de los 7 primeros días y de los 7 últimos)
+    
+    """
+    batches = x.shape[0]
+    output_length = y_true.shape[1]
+
+    plt.figure(figsize=(12, 8))
+    # Inicializar estructuras para almacenar las predicciones y valores reales por día
+    predicciones_por_dia = defaultdict(list)
+    valores_reales_por_dia = defaultdict(list)
+
+    # Recorrer todos los batches y acumular las predicciones y valores reales
+    for i in range(batches):
+        for j in range(output_length):
+            fecha = fechas[i][j].astype('datetime64[D]').item()
+            predicciones_por_dia[fecha].append(y_pred[i][j])
+            valores_reales_por_dia[fecha].append(y_true[i][j])
+
+    # Calcular la media de las predicciones y valores reales para cada día
+    fechas_ordenadas = sorted(predicciones_por_dia.keys())
+    predicciones_medias = np.array([np.mean(predicciones_por_dia[fecha]) for fecha in fechas_ordenadas])
+    valores_reales_medios = np.array([np.mean(valores_reales_por_dia[fecha]) for fecha in fechas_ordenadas])
+    
+    # Encontrar el día con el número máximo de casos para predicciones y casos reales
+    dia_max_pred = fechas_ordenadas[np.argmax(predicciones_medias)]
+    max_casos_pred = np.max(predicciones_medias)
+    
+    dia_max_real = fechas_ordenadas[np.argmax(valores_reales_medios)]
+    max_casos_real = np.max(valores_reales_medios)
+    
+    
+    print("Día con el número máximo de casos (predicciones):", dia_max_pred, ", Casos:", max_casos_pred)
+    print("Día con el número máximo de casos (reales):", dia_max_real, ", Casos:", max_casos_real)
+    
+    # Calcular la diferencia en días entre el pico de predicciones y el pico de casos reales (en valor absoluto)
+    dif_dias_pico = abs((dia_max_pred - dia_max_real).days)
+    
+    print("Diferencia en días entre el pico de predicciones y el pico de casos reales:", dif_dias_pico)
+    
+    # Calcular la diferencia en la magnitud del pico entre predicciones y casos reales
+    dif_magnitud_pico = int(abs(max_casos_real - max_casos_pred))
+    
+    print("Diferencia en la magnitud del pico entre predicciones y casos reales:", dif_magnitud_pico)
+    
+    # Calcular el MAPE para los 45 días antes del pico real
+    # Convertir dia_max_real a numpy.datetime64
+    dia_max_real_np = np.datetime64(dia_max_real)
+    dia_45_dias_antes = dia_max_real_np - np.timedelta64(45, 'D')
+    indice = np.where(fechas_ordenadas == dia_45_dias_antes)[0][0] 
+    y_true_45_dias = valores_reales_medios[indice+1:indice+46]
+    y_pred_45_dias = predicciones_medias[indice+1:indice+46]
+    mape = mean_absolute_percentage_error(y_true_45_dias, y_pred_45_dias)
+    mape_formatted = "{:.6f}".format(mape)
+    
+    print("dia_max_real_np:", dia_max_real_np)
+    print("dia_45_dias_antes:", dia_45_dias_antes)
+    print("indice:", indice)
+    print("y_true_45_dias:", y_true_45_dias)
+    
+    print("MAPE para los 45 días antes del pico real:", mape)
+
+    # Plot de las líneas principales
+    real_cases_line, = plt.plot(fechas_ordenadas, valores_reales_medios, marker='o', color='grey', alpha=0.7, label='Observed Cases')
+    predicted_cases_line, = plt.plot(fechas_ordenadas, predicciones_medias, marker='x', alpha=0.7, label='Mean Predicted Cases')
+    # Dibujar líneas verticales en la gráfica indicando el inicio y fin del cálculo del MAPE
+    plt.axvline(fechas_ordenadas[indice+1], color='mediumorchid', linestyle='--', alpha=0.7)
+    plt.axvline(fechas_ordenadas[indice+45], color='mediumorchid', linestyle='--', alpha=0.7)
+    # Escribir texto en las líneas verticales
+    plt.text(fechas_ordenadas[indice+1], plt.ylim()[1], f'{fechas_ordenadas[indice+1]}', verticalalignment='center', horizontalalignment='right', color='purple', alpha = 0.7, fontsize=16, fontname='Arial')
+    plt.text(fechas_ordenadas[indice + 45], plt.ylim()[1], f'{fechas_ordenadas[indice+45]}', verticalalignment='center', horizontalalignment='right', color='purple', alpha = 0.7, fontsize=16, fontname='Arial')
+    # Rellenar el área entre las dos líneas verticales
+    plt.fill_between(fechas_ordenadas[indice+1:indice+46], 0, 3000, color='magenta', alpha=0.1)
+    # Crear líneas invisibles para las leyendas adicionales
+    lineas_invisibles = [Line2D([0], [0], color='none', marker=None),
+                        Line2D([0], [0], color='none', marker=None),
+                        Line2D([0], [0], color='none', marker=None)]
+    plt.xlabel('Dates', fontsize=20, fontname='Arial')
+    plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+    plt.title('Average Predicted Cases vs Real Data ', fontsize=22, fontname='Arial')
+    plt.xticks(fontsize=14)
+    plt.yticks(fontsize=14)
+    # Incluir las líneas principales y las líneas invisibles en la leyenda
+    plt.legend(handles=[real_cases_line, predicted_cases_line, lineas_invisibles[0], lineas_invisibles[1], lineas_invisibles[2]], 
+              labels=['Observed Cases', 'Mean Predicted Cases', f'Diff. in peak days: {dif_dias_pico}', f'Diff. in peak magnitude: {dif_magnitud_pico}', f'MAPE: {mape_formatted}'], 
+              fontsize=16, loc='upper right')
+    plt.grid(True)
+    plt.ylim(-300, 3100) 
+    plt.show()
+    
+    return predicciones_medias, valores_reales_medios
+    
+    
+intervalos_confianza_1 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+from datetime import datetime, timedelta
+# Definir la fecha de inicio y fin
+fecha_inicio = datetime.strptime('2018-09-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin = datetime.strptime('2019-04-14', '%Y-%m-%d') - timedelta(days=10)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio, end=fecha_fin, periods=154)
+
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+
+# Plotear los límites superior e inferior del intervalo de confianza
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_1]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_1]
+#plt.plot(rango_fechas, intervalos_inferiores, label='Lower Bound', linestyle='--', color='green')
+#plt.plot(rango_fechas, intervalos_superiores, label='Upper Bound', linestyle='--', color='red')
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+
+# Añadir intervalos de confianza del 95%
+#for i in range(len(rango_fechas)):
+#    plt.fill_between([rango_fechas[i]], intervalos_confianza[i][0], intervalos_confianza[i][1], color='#1f77b4', alpha=0.2)
+
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+graficar_predicciones(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+all_predictions, all_true_values = graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+predicciones_medias, valores_reales_medios = media_predicciones(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+# Para la temporada 2019-2020
+test_2 = datos.loc['2019-09-03':'2020-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test_2.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+y_ts_pred_dim,_ = predecir(x_ts, modelo, scaler)
+_, y_ts_pred = predecir(x_ts, modelo, scaler)
+y_ts_inverse = scaler.inverse_transform(y_ts.reshape(-1,1))
+y_ts = y_ts_inverse.reshape(y_ts.shape)
+
+graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+intervalos_confianza_2 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2019-09-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin_2 = datetime.strptime('2020-04-14', '%Y-%m-%d') - timedelta(days=11)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=154)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_2]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_2]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Para la temporada 2023-2024
+
+test_2 = datos.loc['2023-09-03':'2024-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+x_ts_fechas, y_ts_fechas = crear_dataset_supervisado(test_2.index.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+y_ts_pred_dim, _ = predecir(x_ts, modelo, scaler)
+_, y_ts_pred =  predecir(x_ts, modelo, scaler)
+y_ts_inverse = scaler.inverse_transform(y_ts.reshape(-1,1))
+y_ts = y_ts_inverse.reshape(y_ts.shape)
+
+graficar_predicciones_int_conf(x_ts, y_ts, y_ts_pred_dim, y_ts_fechas)
+
+intervalos_confianza_3 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2023-09-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin_2 = datetime.strptime('2024-04-14', '%Y-%m-%d') - timedelta(days=11)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=154)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_3]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_3]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Usando la red LSTM pero ahora alargaremos los datos test y el input_length
+# Seguiremos prediciendo los 14 días siguientes y moviéndonos de 14 en 14 (de momento no se solapan las predicciones)
+
+datos = datos_fechas_casos['casos_pesados_filtrados']
+
+train = datos.loc['2014-09-01':'2017-07-01']
+val = datos.loc['2017-07-02':'2018-08-02']
+test = datos.loc['2018-08-03':'2019-04-14']
+
+
+print(f'Tamaño set de entrenamiento: {train.shape}')
+print(f'Tamaño set de validación: {val.shape}')
+print(f'Tamaño set de prueba: {test.shape}')
+
+INPUT_LENGTH = 60 # 60 días
+OUTPUT_LENGTH = 14 # 30 días (un mes a futuro)
+
+# Datasets supervisados para entrenamiento (x_tr, y_tr), validación
+# (x_vl, y_vl) y prueba (x_ts, y_ts)
+x_tr, y_tr = crear_dataset_supervisado(train.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_vl, y_vl = crear_dataset_supervisado(val.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_ts, y_ts = crear_dataset_supervisado(test.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print('Tamaños entrada (BATCHES x INPUT_LENGTH x FEATURES) y de salida (BATCHES x OUTPUT_LENGTH x FEATURES)')
+print(f'Set de entrenamiento - x_tr: {x_tr.shape}, y_tr: {y_tr.shape}')
+print(f'Set de validación - x_vl: {x_vl.shape}, y_vl: {y_vl.shape}')
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+tf.random.set_seed(123)
+tf.config.experimental.enable_op_determinism()
+
+# El modelo
+N_UNITS_1 = 300
+N_UNITS_2 = 300
+INPUT_SHAPE = (x_tr_s.shape[1], x_tr_s.shape[2]) # cada dato de entrada tiene 60 días x 1 característica
+
+modelo = Sequential()
+modelo.add(LSTM(N_UNITS_1, input_shape=INPUT_SHAPE, return_sequences = True))
+modelo.add(Dropout(0.0))
+modelo.add(LSTM(N_UNITS_2))
+#modelo.add(Dropout(0.2))
+modelo.add(Dense(OUTPUT_LENGTH, activation='linear'))
+
+optimizador = RMSprop(learning_rate=5e-5)
+modelo.compile(
+    optimizer = optimizador,
+    loss = root_mean_squared_error,
+)
+
+EPOCHS = 300
+BATCH_SIZE = 32
+historia = modelo.fit(
+    x = x_tr_s,
+    y = y_tr_s,
+    batch_size = BATCH_SIZE,
+    epochs = EPOCHS,
+    validation_data = (x_vl_s, y_vl_s),
+    verbose=2
+)
+
+# Graficar curvas de entrenamiento y validación
+plt.plot(historia.history['loss'], label = 'RMSE train')
+plt.plot(historia.history['val_loss'], label = 'RMSE val')
+plt.xlabel('Iteración')
+plt.ylabel('RMSE')
+plt.legend();
+
+# Cálculo de rmses para train, val y test
+rmse_tr = modelo.evaluate(x=x_tr_s, y=y_tr_s, verbose=0)
+rmse_vl = modelo.evaluate(x=x_vl_s, y=y_vl_s, verbose=0)
+rmse_ts = modelo.evaluate(x=x_ts_s, y=y_ts_s, verbose=0)
+
+print('Comparativo desempeños:')
+print(f'  RMSE train:\t {rmse_tr:.3f}')
+print(f'  RMSE val:\t {rmse_vl:.3f}')
+print(f'  RMSE test:\t {rmse_ts:.3f}')
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+intervalos_confianza_4 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2018-08-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin_2 = datetime.strptime('2019-04-14', '%Y-%m-%d') - timedelta(days=13)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=182)
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_4]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_4]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Para la temporada 2019-2020
+test_2 = datos.loc['2019-08-03':'2020-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+intervalos_confianza_2 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2019-08-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin_2 = datetime.strptime('2020-04-14', '%Y-%m-%d') - timedelta(days=14)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=182)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_2]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_2]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Para la temporada 2023-2024
+
+test_2 = datos.loc['2023-08-03':'2024-04-14']
+print(f'Tamaño set de prueba: {test_2.shape}')
+x_ts, y_ts = crear_dataset_supervisado(test_2.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+intervalos_confianza_3 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+mape = mean_absolute_percentage_error(y_ts.flatten(), y_ts_pred)
+print("MAPE:", mape)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2023-09-03', '%Y-%m-%d') + timedelta(days=60)
+fecha_fin_2 = datetime.strptime('2024-04-14', '%Y-%m-%d') - timedelta(days=14)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=182)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_3]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_3]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+# Vamos a usar la Red LSTM pero ahora con datos semanales
+
+# Cargar los datos
+datos = datos_fechas_casos['casos_pesados_filtrados']
+
+# Resample semanal sumando los casos
+datos_semanales = datos.resample('W-SUN').sum()
+
+
+#train = datos_semanales.loc['2014-09-07':'2017-09-03']
+#val = datos_semanales.loc['2017-09-03':'2018-09-02']
+#test = datos_semanales.loc['2018-09-02':'2019-04-14']
+
+train = datos_semanales.loc['2014-09-07':'2017-07-02']
+val = datos_semanales.loc['2017-07-02':'2019-12-01']
+test = datos_semanales.loc['2021-06-01':'2024-04-14']
+
+
+print(f'Tamaño set de entrenamiento: {train.shape}')
+print(f'Tamaño set de validación: {val.shape}')
+print(f'Tamaño set de prueba: {test.shape}')
+
+
+
+def crear_dataset_supervisado(array, input_length, output_length):
+
+    # Inicialización
+    X, Y = [], []    # Listados que contendrán los datos de entrada y salida del modelo
+    shape = array.shape
+    if len(shape)==1: # Si tenemos sólo una serie (univariado)
+        fils, cols = array.shape[0], 1
+        array = array.reshape(fils,cols)
+    else: # Multivariado
+        fils, cols = array.shape
+
+    # Generar los arreglos
+    for i in range(0,fils-input_length-output_length,2):
+        X.append(array[i:i+INPUT_LENGTH,0:cols])
+        Y.append(array[i+input_length:i+input_length+output_length,-1].reshape(output_length,1))
+    
+    # Convertir listas a arreglos de NumPy
+    X = np.array(X)
+    Y = np.array(Y)
+    
+    return X, Y
+
+INPUT_LENGTH = 96 # 30 días
+OUTPUT_LENGTH = 2 # 14 días (un mes a futuro)
+
+# Datasets supervisados para entrenamiento (x_tr, y_tr), validación
+# (x_vl, y_vl) y prueba (x_ts, y_ts)
+x_tr, y_tr = crear_dataset_supervisado(train.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_vl, y_vl = crear_dataset_supervisado(val.values, INPUT_LENGTH, OUTPUT_LENGTH)
+x_ts, y_ts = crear_dataset_supervisado(test.values, INPUT_LENGTH, OUTPUT_LENGTH)
+
+print('Tamaños entrada (BATCHES x INPUT_LENGTH x FEATURES) y de salida (BATCHES x OUTPUT_LENGTH x FEATURES)')
+print(f'Set de entrenamiento - x_tr: {x_tr.shape}, y_tr: {y_tr.shape}')
+print(f'Set de validación - x_vl: {x_vl.shape}, y_vl: {y_vl.shape}')
+print(f'Set de prueba - x_ts: {x_ts.shape}, y_ts: {y_ts.shape}')
+
+# Crear diccionario de entrada
+data_in = {
+    'x_tr': x_tr, 'y_tr': y_tr,
+    'x_vl': x_vl, 'y_vl': y_vl,
+    'x_ts': x_ts, 'y_ts': y_ts,
+}
+
+data_s, scaler = escalar_dataset(data_in)
+
+x_tr_s, y_tr_s = data_s['x_tr_s'], data_s['y_tr_s']
+x_vl_s, y_vl_s = data_s['x_vl_s'], data_s['y_vl_s']
+x_ts_s, y_ts_s = data_s['x_ts_s'], data_s['y_ts_s']
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.optimizers import RMSprop
+import tensorflow as tf
+from tensorflow.keras.layers import Dropout
+from keras.regularizers import l2
+
+tf.random.set_seed(123)
+tf.config.experimental.enable_op_determinism()
+
+# El modelo
+N_UNITS_1 = 350
+N_UNITS_2 = 200
+INPUT_SHAPE = (x_tr_s.shape[1], x_tr_s.shape[2]) # cada dato de entrada tiene 60 días x 1 característica
+
+modelo = Sequential()
+modelo.add(LSTM(N_UNITS_1, input_shape=INPUT_SHAPE, return_sequences = True))
+modelo.add(Dropout(0.2))
+modelo.add(LSTM(N_UNITS_2))
+#modelo.add(Dropout(0.2))
+modelo.add(Dense(OUTPUT_LENGTH, activation='linear'))
+
+def root_mean_squared_error(y_true, y_pred):
+    rmse = tf.math.sqrt(tf.math.reduce_mean(tf.square(y_pred-y_true)))
+    return rmse
+
+optimizador = RMSprop(learning_rate=5e-5)
+modelo.compile(
+    optimizer = optimizador,
+    loss = root_mean_squared_error,
+)
+
+EPOCHS = 300
+BATCH_SIZE = 32
+historia = modelo.fit(
+    x = x_tr_s,
+    y = y_tr_s,
+    batch_size = BATCH_SIZE,
+    epochs = EPOCHS,
+    validation_data = (x_vl_s, y_vl_s),
+    verbose=2
+)
+
+# Graficar curvas de entrenamiento y validación
+plt.plot(historia.history['loss'], label = 'RMSE train')
+plt.plot(historia.history['val_loss'], label = 'RMSE val')
+plt.xlabel('Iteración')
+plt.ylabel('RMSE')
+plt.legend();
+
+# Cálculo de rmses para train, val y test
+rmse_tr = modelo.evaluate(x=x_tr_s, y=y_tr_s, verbose=0)
+rmse_vl = modelo.evaluate(x=x_vl_s, y=y_vl_s, verbose=0)
+rmse_ts = modelo.evaluate(x=x_ts_s, y=y_ts_s, verbose=0)
+
+print('Comparativo desempeños:')
+print(f'  RMSE train:\t {rmse_tr:.3f}')
+print(f'  RMSE val:\t {rmse_vl:.3f}')
+print(f'  RMSE test:\t {rmse_ts:.3f}')
+
+y_ts_pred = predecir(x_ts_s, modelo, scaler)
+
+intervalos_confianza_3 = cálculo_intervalos_confianza(y_ts_pred, y_ts)
+# Definir la fecha de inicio y fin
+fecha_inicio_2 = datetime.strptime('2021-06-01', '%Y-%m-%d') + timedelta(weeks=96)
+fecha_fin_2 = datetime.strptime('2024-04-14', '%Y-%m-%d') - timedelta(weeks=2)
+# Generar el rango de fechas
+rango_fechas = pd.date_range(start=fecha_inicio_2, end=fecha_fin_2, periods=52)
+
+# Crear el gráfico
+plt.figure(figsize=(12, 8))
+plt.plot(rango_fechas, y_ts.flatten(), 'o', label='Real Data', color='black', markersize=3)
+plt.plot(rango_fechas, y_ts_pred, label='Predictions', color='blue')
+intervalos_inferiores = [intervalo[0] for intervalo in intervalos_confianza_3]
+intervalos_superiores = [intervalo[1] for intervalo in intervalos_confianza_3]
+plt.fill_between(rango_fechas, intervalos_inferiores, intervalos_superiores, color='blue', alpha=0.2)
+plt.xlabel('Dates', fontsize=20, fontname='Arial')
+plt.ylabel('Number of cases', fontsize=20, fontname='Arial')
+plt.title('Predictions vs Real Data', fontsize=22, fontname='Arial')
+plt.legend(fontsize = 18)
+plt.xticks(fontsize=14)
+plt.yticks(fontsize=14)
+plt.show()
+
+
+# MODELO ARIMA
+
+# Comprobamos si el conjunto de datos es estacionario o no
+from statsmodels.tsa.stattools import adfuller
+test_result = datos_fechas_casos['casos_pesados_filtrados']
+
+def adfuller_test(casos):
+    result = adfuller(casos)
+    labels = ['ADF Test Statistic','p-value','#Lags Used','Number of Observations']
+    for value,label in zip(result,labels):
+        print(label+' : '+str(value) )
+    if result[1] <= 0.05:
+        print("strong evidence against the null hypothesis(Ho), reject the null hypothesis. Data is stationary")
+    else:
+        print("weak evidence against null hypothesis,indicating it is non-stationary ")
+
+adfuller_test(datos_fechas_casos['casos_pesados_filtrados'])
+
+# Creamos autrocorrelación
+from pandas.plotting import autocorrelation_plot
+import statsmodels.api as sm
+
+autocorrelation_plot(datos_fechas_casos['casos_pesados_filtrados'])
+plt.show()
+
+# Datos estacionarios
+# p=1, d=0, q=1
+
+datos = datos_fechas_casos['casos_pesados_filtrados']
+datos = datos.loc[:'2019-06-02']
+df = pd.DataFrame(datos)
+df.index = pd.to_datetime(df.index) 
+train = df.loc[:'2018-06-01']
+test = df.loc['2018-06-02':'2019-06-02']
+
+# Construimos modelo Arima
+
+from statsmodels.tsa.arima.model import ARIMA
+
+model = ARIMA(train, order=(3, 0, 3))  
+fitted = model.fit()  
+
+# Forecast
+fc = fitted.forecast(366)
+fc_series = pd.Series(fc, index=test.index)
+
+plt.figure(figsize=(12,5), dpi=100)
+plt.plot(train, label='training')
+plt.plot(test, label='actual')
+plt.plot(fc_series, label='forecast')
+
+import pmdarima as pm
+# Suponiendo que no sea estacionario
+modelo_auto = pm.auto_arima(train, start_p=1, start_q=1,
+                      test='adf',       # use adftest to find optimal 'd'
+                      max_p=3, max_q=3, # maximum p and q
+                      m=1,              # frequency of series
+                      d=None,           # let model determine 'd'
+                      seasonal=False,   # No Seasonality
+                      start_P=0, 
+                      D=0, 
+                      trace=True,
+                      error_action='ignore',  
+                      suppress_warnings=True, 
+                      stepwise=True)
+
+print(modelo_auto.summary())
+#Best model:  ARIMA(2,0,3)(0,0,0)[0] intercept
+
+# Modelo Auto-Arima
+# Obtenemos los mejores parámetros p,d,q,P,D,Q
+# Parámetro m se refiere al número de periodo para cada estacionalidad, en nuestro caso m = 1 (anual)
+from pmdarima import auto_arima  
+ 
+modelo_auto2 = auto_arima(train,start_p=0,d=None,start_q=0,
+          max_p=4,max_d=2,max_q=4, start_P=0,
+          D=1, start_Q=0, max_P=2,max_D=1,
+          max_Q=2, m=7, seasonal=True,
+          error_action='warn',trace=True,
+          supress_warnings=True,stepwise=True,
+          random_state=200,n_fits=50)
+print(modelo_auto2)
+print(modelo_auto2.summary())
+
+# Best model:  ARIMA(4,1,2)(0,0,0)[0]          
+# Total fit time: 34.905 seconds
+# ARIMA(4,1,2)(0,0,0)[0]  
+
+# Best model:  ARIMA(4,1,2)(2,1,0)[12] 
+#predicciones=modelo_auto.predict(start = '2018-06-02', end = '2019-06-02', typ = "levels")
+
+# Best model:  ARIMA(2,0,3)(2,1,0)[7]
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+arima_model = SARIMAX(train, order = (2,0,3), seasonal_order = (2,1,0,7)) 
+arima_result = arima_model.fit() 
+arima_result.summary()
+
+# Gráfico de línea de errores residuales
+residuals = pd.DataFrame(arima_result.resid)
+residuals.plot(figsize = (16,5))
+plt.show()
+
+plt.style.use('seaborn')
+modelo_auto.plot_diagnostics(figsize=(20,8))
+plt.show()
+
+# Forma 1 para predecir
+arima_pred = arima_result.predict(start = len(train), end = len(df)-1, typ="levels").rename("ARIMA Predictions")
+
+# Forma 2 para predecir
+arima_pred2 = arima_result.predict(start='2018-06-02',end='2019-06-02', typ="levels").rename("ARIMA Predictions")
+
+plt.plot(test, label="Casos reales")
+plt.plot(arima_pred2, color="lime", label="Predicciones")
+plt.title("Predicción con Modelo Arima", fontsize=15);
+plt.xlabel('Días')
+plt.ylabel('Número de casos')
+plt.legend( fontsize=15);
+plt.show();
+
+
+df['forecast'] = arima_result.predict(start='2018-06-02', end='2019-06-02', dynamic=True)
+df[['casos_pesados_filtrados', 'forecast']].plot(figsize = (12,8))
+
+
+
+
+model = sm.tsa.statespace.SARIMAX(df, order=(1,0,1), seasonal_order=(1,0,1,365))
+model_fit=model.fit()
+model_fit.summary()
 
